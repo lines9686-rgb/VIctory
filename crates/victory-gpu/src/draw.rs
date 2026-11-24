@@ -187,11 +187,7 @@ impl State {
             }
             t => t,
         };
-        // SAFETY: an open list.
-        unsafe {
-            list.list
-                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
-        };
+        list.set_topology(D3D_PRIMITIVE_TOPOLOGY(host as i32));
     }
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
@@ -259,11 +255,11 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
+        if crate::host::host().is_none() {
             return;
-        };
+        }
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut color = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -278,25 +274,40 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            color.push((texture.clone(), record.desc()));
         }
         self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let depth = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture.clone(), record.depth_desc()))
         });
-        // SAFETY: an open list; the views were just made.
-        unsafe {
-            list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
-                false,
-                dsv.as_ref().map(std::ptr::from_ref),
-            )
-        };
+        list.set_targets(color, depth);
+    }
+
+    /// Forgets what the host list has bound (pipeline, root signatures,
+    /// heaps): the next draw or dispatch binds its own again, as after a
+    /// pass of ours (`HostList::take_clobbered`).
+    fn forget_host(&mut self) {
+        self.host_heaps = [usize::MAX; 2];
+        self.host_roots = [0; 2];
+        self.host_pipeline = 0;
+    }
+
+    /// The draw's render targets and depth target in their states. A depth
+    /// target whose unordered access twin holds what shaders wrote is made
+    /// current then, which may take a pass of ours.
+    fn ready_targets(&self, list: &HostList) {
+        const RENDER_TARGET: u32 = 0x4;
+        const DEPTH_WRITE: u32 = 0x10;
+        for &t in &self.targets {
+            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        }
+        if self.depth != 0 {
+            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+        }
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -358,6 +369,9 @@ impl State {
             );
             return false;
         }
+        // Targets first: a pass of ours that makes a depth target current
+        // sets state of its own, which `bind` then replaces.
+        self.ready_targets(list);
         if !self.bind(list, p, false) {
             return false;
         }
@@ -403,13 +417,15 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
-        const RENDER_TARGET: u32 = 0x4;
-        const DEPTH_WRITE: u32 = 0x10;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
-        if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+        // Again: the draw's shaders may read its targets too.
+        self.ready_targets(list);
+        // Only a draw that writes its own depth target through unordered
+        // access gets here with a pass of ours after its state: it would
+        // run with ours.
+        if list.take_clobbered() {
+            once!("a draw writing its depth target through unordered access dropped");
+            self.forget_host();
+            return false;
         }
         true
     }
@@ -423,6 +439,31 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // What the shaders read through tables first: readying it may take
+        // passes of ours (a depth target made current from its unordered
+        // access twin) that set pipeline, root signature and heaps of their
+        // own, so the draw's are set after.
+        let mut made_tables = Vec::with_capacity(p.stages.len());
+        for stage in &p.stages {
+            let t = stage.translated();
+            self.table_failed = false;
+            let made = self.tables(list, &t.used, compute);
+            if self.table_failed {
+                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::warn!(
+                        dropped = n,
+                        "a draw or dispatch dropped: no dynamic slots for its tables"
+                    );
+                }
+                return false;
+            }
+            made_tables.push(made);
+        }
+        if list.take_clobbered() {
+            self.forget_host();
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -462,21 +503,8 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
-        for stage in &p.stages {
+        for (stage, made) in p.stages.iter().zip(&made_tables) {
             let t = stage.translated();
-            self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
-            if self.table_failed {
-                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
-                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::warn!(
-                        dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
-                    );
-                }
-                return false;
-            }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -1459,15 +1487,14 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
-/// Fixed-function state, straight onto the host list.
+/// Fixed-function state, straight onto the host list (which keeps the
+/// viewports and scissors for passes of ours to set back).
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetViewports(viewports) };
+    list.set_viewports(viewports);
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetScissorRects(rects) };
+    list.set_scissors(rects);
 }
 
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {

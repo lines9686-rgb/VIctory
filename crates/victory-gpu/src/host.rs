@@ -345,6 +345,13 @@ pub(crate) struct HostList {
     /// Depth targets the list gave unordered access to since it last made
     /// them current: their twins hold their contents until copied back.
     twins: Mutex<Vec<(HostCopy, HostCopy)>>,
+    /// The fixed-function state the title last set (`draw`), which passes
+    /// of ours set again after they change it ([`HostList::restore_fixed`]).
+    fixed: Mutex<Fixed>,
+    /// Whether passes of ours set pipeline, root signatures and descriptor
+    /// heaps of their own since the title's draw state last bound its own
+    /// ([`HostList::take_clobbered`]).
+    clobbered: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -377,6 +384,31 @@ type States = std::collections::HashMap<
 
 /// A title texture's host copy, as lists hold it.
 type HostCopy = std::sync::Arc<crate::resource::HostTexture>;
+
+/// A render or depth target as the title binds it: the host texture and the
+/// description its view is made from (views are made as they are bound).
+pub(crate) type Target<D> = (ID3D12Resource, Option<D>);
+
+/// Render targets and the depth target, as [`HostList::set_targets`] takes
+/// them.
+type Targets = (
+    Vec<Target<D3D12_RENDER_TARGET_VIEW_DESC>>,
+    Option<Target<D3D12_DEPTH_STENCIL_VIEW_DESC>>,
+);
+
+/// The fixed-function state the title sets on a host list, as it last set
+/// it: what passes of ours change and set back.
+#[derive(Default)]
+struct Fixed {
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    topology: Option<windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY>,
+    /// If the title bound any.
+    targets: Option<Targets>,
+}
+
+// SAFETY: D3D12 resources are free-threaded; used under the list's lock.
+unsafe impl Send for Fixed {}
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -596,6 +628,8 @@ impl Host {
                 arguments: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                fixed: Mutex::default(),
+                clobbered: std::sync::atomic::AtomicBool::new(false),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -1009,6 +1043,8 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.fixed() = Fixed::default();
+        self.clobbered.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1120,10 +1156,26 @@ impl HostList {
     /// plane and a single-plane twin copy one plane, one subresource at a
     /// time: the depth plane (plane 0, numbered as the twin's subresources)
     /// or, for the stencil's R8 twin, plane 1 (after all of plane 0's); the
-    /// other plane keeps its values.
+    /// other plane keeps its values. A depth plane whose twin has fewer bits
+    /// (`HostTexture::planes`) is converted by a pass of ours instead
+    /// ([`HostList::convert_plane`]), which leaves pipeline, root signature
+    /// and heaps of its own for the title's next draw or dispatch to replace.
     fn copy_texture(&self, dst: &HostCopy, src: &HostCopy) {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
+        // A depth plane kept in a twin of fewer bits moves through passes
+        // of ours instead.
+        let to_depth = dst.twin.is_some() || dst.stencil.is_some();
+        let (depth, twin) = if to_depth { (dst, src) } else { (src, dst) };
+        if let Some(views) = &depth.planes
+            && depth
+                .twin
+                .as_ref()
+                .is_some_and(|t| std::sync::Arc::ptr_eq(t, twin))
+        {
+            self.convert_plane(depth, twin, views, to_depth);
+            return;
+        }
         let barriers: Vec<D3D12_RESOURCE_BARRIER> =
             [self.move_to(dst, COPY_DEST), self.move_to(src, COPY_SOURCE)]
                 .into_iter()
@@ -1176,6 +1228,149 @@ impl HostList {
                 }
             }
         }
+    }
+
+    /// Records the move of a depth plane kept in a twin of fewer bits
+    /// (`views`): the twin's values written as the depth (`to_depth`), or
+    /// the depth plane written into the twin, by passes of ours
+    /// ([`crate::depth_twin`]), with the transitions they need. Nothing if
+    /// the pass cannot run (logged).
+    fn convert_plane(
+        &self,
+        depth: &HostCopy,
+        twin: &HostCopy,
+        views: &crate::depth_twin::Views,
+        to_depth: bool,
+    ) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const DEPTH_WRITE: u32 = 0x10;
+        const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        if !crate::depth_twin::ready(views, to_depth) {
+            return;
+        }
+        let (depth_state, twin_state) = if to_depth {
+            (DEPTH_WRITE, PIXEL_SHADER_RESOURCE)
+        } else {
+            (NON_PIXEL_SHADER_RESOURCE, UNORDERED_ACCESS)
+        };
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = [
+            self.move_to(depth, depth_state),
+            self.move_to(twin, twin_state),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live textures.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+        if to_depth {
+            crate::depth_twin::to_depth(self, views, &depth.texture);
+        } else {
+            crate::depth_twin::to_twin(self, views, &twin.texture);
+        }
+    }
+
+    fn fixed(&self) -> std::sync::MutexGuard<'_, Fixed> {
+        self.fixed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The title's viewports, set on the list and kept for
+    /// [`HostList::restore_fixed`].
+    pub(crate) fn set_viewports(&self, viewports: &[D3D12_VIEWPORT]) {
+        // SAFETY: an open list.
+        unsafe { self.list.RSSetViewports(viewports) };
+        self.fixed().viewports = viewports.to_vec();
+    }
+
+    /// The title's scissor rectangles, as [`HostList::set_viewports`].
+    pub(crate) fn set_scissors(&self, rects: &[RECT]) {
+        // SAFETY: an open list.
+        unsafe { self.list.RSSetScissorRects(rects) };
+        self.fixed().scissors = rects.to_vec();
+    }
+
+    /// The title's primitive topology (in the host's numbering), as
+    /// [`HostList::set_viewports`].
+    pub(crate) fn set_topology(
+        &self,
+        topology: windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY,
+    ) {
+        // SAFETY: an open list.
+        unsafe { self.list.IASetPrimitiveTopology(topology) };
+        self.fixed().topology = Some(topology);
+    }
+
+    /// The title's render targets and depth target, bound through fresh
+    /// views and kept as [`HostList::set_viewports`].
+    pub(crate) fn set_targets(
+        &self,
+        color: Vec<Target<D3D12_RENDER_TARGET_VIEW_DESC>>,
+        depth: Option<Target<D3D12_DEPTH_STENCIL_VIEW_DESC>>,
+    ) {
+        self.bind_targets(&color, depth.as_ref());
+        self.fixed().targets = Some((color, depth));
+    }
+
+    fn bind_targets(
+        &self,
+        color: &[Target<D3D12_RENDER_TARGET_VIEW_DESC>],
+        depth: Option<&Target<D3D12_DEPTH_STENCIL_VIEW_DESC>>,
+    ) {
+        let Some(host) = host() else {
+            return;
+        };
+        let rtvs: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = color
+            .iter()
+            .map(|(texture, desc)| host.rtv(texture, desc.as_ref()))
+            .collect();
+        let dsv = depth.map(|(texture, desc)| host.dsv(texture, desc.as_ref()));
+        // SAFETY: an open list; the views were just made.
+        unsafe {
+            self.list.OMSetRenderTargets(
+                rtvs.len() as u32,
+                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                false,
+                dsv.as_ref().map(std::ptr::from_ref),
+            )
+        };
+    }
+
+    /// Sets the title's targets, viewports, scissors and topology on the
+    /// list again, as it last set them, after a pass of ours changed them.
+    pub(crate) fn restore_fixed(&self) {
+        let fixed = self.fixed();
+        // SAFETY: an open list.
+        unsafe {
+            if !fixed.viewports.is_empty() {
+                self.list.RSSetViewports(&fixed.viewports);
+            }
+            if !fixed.scissors.is_empty() {
+                self.list.RSSetScissorRects(&fixed.scissors);
+            }
+            if let Some(topology) = fixed.topology {
+                self.list.IASetPrimitiveTopology(topology);
+            }
+        }
+        match &fixed.targets {
+            Some((color, depth)) => self.bind_targets(color, depth.as_ref()),
+            // SAFETY: an open list.
+            None => unsafe { self.list.OMSetRenderTargets(0, None, false, None) },
+        }
+    }
+
+    /// Notes that a pass of ours set its own pipeline, root signature and
+    /// descriptor heaps on the list.
+    pub(crate) fn clobber(&self) {
+        self.clobbered.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a pass of ours set its own pipeline, root signature and
+    /// descriptor heaps since the last call: the title's draw state then
+    /// binds its own again.
+    pub(crate) fn take_clobbered(&self) -> bool {
+        self.clobbered.swap(false, Ordering::Relaxed)
     }
 
     /// At submission: the list that moves each texture this list uses from
