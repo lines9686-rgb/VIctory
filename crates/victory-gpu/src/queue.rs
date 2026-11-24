@@ -289,6 +289,22 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
+        #[cfg(feature = "diagnostics")]
+        let fallback_1440p = crate::capture::take_1440p_target();
+        #[cfg(feature = "diagnostics")]
+        let shown = if let Some(ref copy) = fallback_1440p {
+            // LOCAL adaptation of mpDom's d6897fa to the single-plane present:
+            // show the frame's 2560x1440 world target instead of plane 0.
+            let st = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!("VICTORY_PRESENT_1440P: presenting 2560x1440 world target as plane 0");
+            });
+            host.present(&copy.texture, st, frame)
+        } else {
+            host.present(texture, state, frame)
+        };
+        #[cfg(not(feature = "diagnostics"))]
         let shown = host.present(texture, state, frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
