@@ -929,6 +929,8 @@ mod tests {
             )
         };
         assert_eq!(ba, bb);
+    }
+}
 
 #[cfg(test)]
 mod wave_tests {
