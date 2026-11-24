@@ -300,7 +300,47 @@ fn needs_wave64(stage: &str, wave64: bool, lanes: u32) -> bool {
     static ALLOW_MESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let allow_mesh = *ALLOW_MESH
         .get_or_init(|| std::env::var("VICTORY_LOCAL_WAVE64_MESH").is_ok_and(|v| v == "1"));
-    wave64 && lanes < 64 && (stage == "compute" || (stage == "mesh" && !allow_mesh))
+    // LOCAL test: VICTORY_LOCAL_WAVE64_COMPUTE=1 keeps wave64 compute programs
+    // and judges them by their translation instead (see `emitted_wave_lanes`),
+    // as #578's later head does.
+    static ALLOW_COMPUTE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let allow_compute = *ALLOW_COMPUTE
+        .get_or_init(|| std::env::var("VICTORY_LOCAL_WAVE64_COMPUTE").is_ok_and(|v| v == "1"));
+    wave64
+        && lanes < 64
+        && ((stage == "compute" && !allow_compute) || (stage == "mesh" && !allow_mesh))
+}
+
+/// The wave-lane range `(min, max)` an emitted module's `PSV0` requires, or
+/// `None` when it declares none. The translator declares one only for code
+/// that needs the host's wave to be a given size: a console wave64 compute
+/// program it lowered per lane declares none, one it runs as two 32-lane
+/// halves (split, or in the console flow) declares 32, and one it left in
+/// the console's lanes declares 64.
+fn emitted_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
+    let container = victory_shader::Container::parse(dxil).ok()?;
+    let psv = container.part(victory_shader::FourCC::PSV0)?.data;
+    let word = |at: usize| {
+        psv.get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("four bytes")))
+    };
+    // The runtime info's size, then its 16-byte stage union, then the
+    // minimum and maximum expected lane counts.
+    if word(0)? < 24 {
+        return None;
+    }
+    let (min, max) = (word(20)?, word(24)?);
+    if min == 0 && (max == 0 || max == u32::MAX) {
+        return None;
+    }
+    Some((min.max(1), if max == 0 { u32::MAX } else { max }))
+}
+
+/// Whether a module requiring `emitted` lanes (see [`emitted_wave_lanes`])
+/// cannot run on a host whose waves have `host` = (min, max) lanes. D3D12
+/// refuses a fixed wave size outside the host's range.
+fn emitted_wave_unsupported(emitted: Option<(u32, u32)>, (host_min, host_max): (u32, u32)) -> bool {
+    emitted.is_some_and(|(min, max)| host_max < min || host_min > max)
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -359,8 +399,20 @@ impl HostPipeline {
                 shaders,
             );
         }
+        let target = host()?.target();
         for (s, _) in &stages {
-            s.translated()?;
+            let t = s.translated()?;
+            if s.stage == "compute"
+                && emitted_wave_unsupported(
+                    emitted_wave_lanes(&t.host.dxil),
+                    (target.lanes_min, target.lanes_max),
+                )
+            {
+                return refuse(
+                    "a compute program translated for a wave size the host does not run",
+                    shaders,
+                );
+            }
         }
         let host = host()?;
 
@@ -733,7 +785,57 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
-    use super::needs_wave64;
+    use super::{emitted_wave_lanes, emitted_wave_unsupported, needs_wave64};
+
+    /// A container holding only a `PSV0` part (runtime info version 2,
+    /// 48 bytes) whose expected lane counts are `min` and `max`.
+    fn psv0_container(min: u32, max: u32) -> Vec<u8> {
+        let mut psv = 48u32.to_le_bytes().to_vec();
+        let mut info = [0u8; 48];
+        info[16..20].copy_from_slice(&min.to_le_bytes());
+        info[20..24].copy_from_slice(&max.to_le_bytes());
+        psv.extend_from_slice(&info);
+        // Header (32 bytes), one part offset, the part's header, the part.
+        let offset = 36u32;
+        let total = offset + 8 + psv.len() as u32;
+        let mut out = b"DXBC".to_vec();
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&total.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.extend_from_slice(b"PSV0");
+        out.extend_from_slice(&(psv.len() as u32).to_le_bytes());
+        out.extend_from_slice(&psv);
+        out
+    }
+
+    #[test]
+    fn emitted_wave_lanes_reads_the_modules_range() {
+        // What the translator writes for no wave size (0, all ones).
+        assert_eq!(emitted_wave_lanes(&psv0_container(0, u32::MAX)), None);
+        assert_eq!(emitted_wave_lanes(&psv0_container(0, 0)), None);
+        assert_eq!(emitted_wave_lanes(&psv0_container(32, 32)), Some((32, 32)));
+        assert_eq!(emitted_wave_lanes(&psv0_container(64, 64)), Some((64, 64)));
+        // No container, or no PSV0 part.
+        assert_eq!(emitted_wave_lanes(b"not a container"), None);
+    }
+
+    #[test]
+    fn compute_is_judged_by_the_wave_size_its_translation_needs() {
+        let (nvidia, rdna, warp) = ((32, 32), (32, 64), (4, 4));
+        // Per lane (two 32-lane halves of a console wave64 are fine): any host.
+        for host in [nvidia, rdna, warp] {
+            assert!(!emitted_wave_unsupported(None, host));
+        }
+        // Split or console flow: 32-lane waves.
+        assert!(!emitted_wave_unsupported(Some((32, 32)), nvidia));
+        assert!(!emitted_wave_unsupported(Some((32, 32)), rdna));
+        assert!(emitted_wave_unsupported(Some((32, 32)), warp));
+        // The console's lanes: 64-lane waves only.
+        assert!(emitted_wave_unsupported(Some((64, 64)), nvidia));
+        assert!(!emitted_wave_unsupported(Some((64, 64)), rdna));
+    }
 
     #[test]
     fn wave64_mesh_and_compute_need_64_lane_hosts() {
