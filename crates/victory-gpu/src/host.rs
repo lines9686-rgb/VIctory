@@ -1528,15 +1528,28 @@ fn read_partial(src: *const u8, dst: *mut u8, len: usize) -> (bool, usize) {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // LOCAL (after LooperSalty's measurement on #841): WriteProcessMemory
+    // queries the region before every write (~2 ms per call on the title's
+    // big heaps); the native call has the same per-page success semantics
+    // without that query.
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtWriteVirtualMemory(
+            process: windows_sys::Win32::Foundation::HANDLE,
+            base: *mut core::ffi::c_void,
+            buffer: *const core::ffi::c_void,
+            size: usize,
+            written: *mut usize,
+        ) -> i32;
+    }
     let write_partial = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
         let ok = unsafe {
-            WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0
+            NtWriteVirtualMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) >= 0
         };
         (ok, done)
     };
