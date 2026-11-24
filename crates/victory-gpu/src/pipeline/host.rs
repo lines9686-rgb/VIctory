@@ -643,6 +643,14 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            tracing::debug!(
+                ?shaders,
+                depth = ?g.depth,
+                dsv = g.depth_format.0,
+                targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
+                raster = ?g.rasterizer,
+                "host graphics state"
+            );
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -1544,6 +1552,243 @@ mod rect_tests {
             }
             readback.Unmap(0, None);
             covered
+        }
+    }
+}
+
+#[cfg(test)]
+mod mesh_depth_tests {
+    use super::*;
+    use windows::Win32::Foundation::RECT;
+    use windows::core::Interface;
+
+    /// A mesh stage drawing one triangle over the whole target at depth
+    /// 0.25, with no pixel stage (a depth-only pass).
+    const MS: &str = "struct V { float4 pos : SV_Position; };
+        [outputtopology(\"triangle\")]
+        [numthreads(1, 1, 1)]
+        void main(out vertices V v[3], out indices uint3 t[1]) {
+            SetMeshOutputCounts(3, 1);
+            v[0].pos = float4(-1, -1, 0.25, 1);
+            v[1].pos = float4(-1, 3, 0.25, 1);
+            v[2].pos = float4(3, -1, 0.25, 1);
+            t[0] = uint3(0, 1, 2);
+        }";
+    const SIDE: u32 = 8;
+
+    /// A depth-only mesh pipeline made from the title's state as streams
+    /// carry it (reverse depth: cleared to 0, test greater-or-equal, writes
+    /// on, stencil replaced, a 32-bit depth with stencil) puts its depth in
+    /// the depth plane.
+    #[test]
+    fn a_depth_only_mesh_pipeline_writes_the_depth_plane() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        if !host.mesh_shaders() {
+            return;
+        }
+        let Ok(ms) = dxc_compile(MS, "ms_6_5") else {
+            return; // no compiler on this machine
+        };
+        let mut g = GraphicsState::default();
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        g.depth.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        g.depth.StencilEnable = true.into();
+        g.depth.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+        g.depth.BackFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+        g.depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        let depth = drawn_depth(&host.device, &ms, &g);
+        assert_eq!(depth.len(), (SIDE * SIDE) as usize);
+        assert!(depth.iter().all(|&d| d == 0.25), "{depth:?}");
+    }
+
+    /// The depth plane after one mesh dispatch of `ms` with state `g` on a
+    /// `SIDE`-square R32G8X24 target cleared to depth 0, stencil 0.
+    fn drawn_depth(device: &ID3D12Device, ms: &[u8], g: &GraphicsState) -> Vec<f32> {
+        let code = |b: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: b.as_ptr().cast(),
+            BytecodeLength: b.len(),
+        };
+        // SAFETY: plain D3D12 calls on objects made here; every pointer
+        // names live local data.
+        unsafe {
+            let mut blob = None;
+            D3D12SerializeVersionedRootSignature(
+                &D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                    Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+                    Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                        Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1::default(),
+                    },
+                },
+                &mut blob,
+                None,
+            )
+            .unwrap();
+            let blob: ID3DBlob = blob.unwrap();
+            let root: ID3D12RootSignature = device
+                .CreateRootSignature(
+                    0,
+                    std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()),
+                )
+                .unwrap();
+            let pso = mesh_pipeline(
+                device,
+                &root,
+                code(ms),
+                D3D12_SHADER_BYTECODE::default(),
+                g,
+                "mesh depth test",
+            )
+            .unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: u64::from(SIDE),
+                Height: SIDE,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R32G8X24_TYPELESS,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                ..Default::default()
+            };
+            let mut target: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    None,
+                    &mut target,
+                )
+                .unwrap();
+            let target = target.unwrap();
+            // The depth plane: subresource 0.
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0;
+            device.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+            let mut readback: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: total,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+            let readback = readback.unwrap();
+            let views: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let view = views.GetCPUDescriptorHandleForHeapStart();
+            let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            device.CreateDepthStencilView(&target, Some(&dsv), view);
+
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso)
+                .unwrap();
+            let list6: ID3D12GraphicsCommandList6 = list.cast().unwrap();
+            list.SetGraphicsRootSignature(&root);
+            list.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: SIDE as f32,
+                Height: SIDE as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            list.RSSetScissorRects(&[RECT {
+                left: 0,
+                top: 0,
+                right: SIDE as i32,
+                bottom: SIDE as i32,
+            }]);
+            list.OMSetRenderTargets(0, None, false, Some(&view));
+            list.ClearDepthStencilView(
+                view,
+                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                0.0,
+                0,
+                None,
+            );
+            list.OMSetStencilRef(7);
+            list6.DispatchMesh(1, 1, 1);
+            list.ResourceBarrier(&[crate::host::transition(
+                &target,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyTextureRegion(
+                &D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: footprint,
+                    },
+                },
+                0,
+                0,
+                0,
+                &D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&target),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                },
+                None,
+            );
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            let started = std::time::Instant::now();
+            while fence.GetCompletedValue() < 1 {
+                assert!(started.elapsed().as_secs() < 30, "the dispatch did not finish");
+                std::thread::yield_now();
+            }
+            let mut at = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut at)).unwrap();
+            let pitch = footprint.Footprint.RowPitch as usize;
+            let mut out = Vec::new();
+            for y in 0..SIDE as usize {
+                for x in 0..SIDE as usize {
+                    out.push(at.cast::<u8>().add(y * pitch + x * 4).cast::<f32>().read_unaligned());
+                }
+            }
+            readback.Unmap(0, None);
+            out
         }
     }
 }

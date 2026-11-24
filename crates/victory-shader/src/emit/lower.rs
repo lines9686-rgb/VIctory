@@ -7179,6 +7179,10 @@ impl<'a> Lower<'a> {
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            // An explicit level: DXIL's gather has none (level 0), so the
+            // four texels are sampled at that level instead
+            // (`Lower::gather_at_level`).
+            "image_gather4_l" | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -7223,6 +7227,8 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
+        // A gather at an explicit level: its four values, in gather order.
+        let mut gathered: Option<[V; 4]> = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -7422,16 +7428,32 @@ impl<'a> Lower<'a> {
                             os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
                         }
                     }
-                    args.extend(&os[..2]);
-                    args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    if matches!(name, "image_gather4_l" | "image_gather4_l_o") {
+                        // The level follows the coordinates.
+                        let lod = addr_val(self, first + coords)?;
+                        let lod = to_float(self, lod);
+                        let offset = if offset_word {
+                            [os[0], os[1]]
+                        } else {
+                            [zero, zero]
+                        };
+                        let channel = dmask.trailing_zeros();
+                        let values =
+                            self.gather_at_level(h, sh, kind, &cs, lod, offset, channel)?;
+                        gathered = Some(values);
+                        self.s.m.undef(self.s.t.res_ret)
+                    } else {
+                        args.extend(&os[..2]);
+                        args.push(self.s.m.i32(dmask.trailing_zeros()));
+                        self.s.op(
+                            c,
+                            "textureGather.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            73,
+                            &args,
+                        )
+                    }
                 }
             }
         } else {
@@ -7470,7 +7492,10 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+            let x = match gathered {
+                Some(g) => g[ch as usize],
+                None => self.s.m.extract(c, r, ch),
+            };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
@@ -7499,6 +7524,91 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// A gather at an explicit level (`image_gather4_l`, `_l_o`): channel
+    /// `channel` of the 2x2 texels around coordinates `cs` at level `lod`,
+    /// in gather order (x the lower left, then counter-clockwise: lower
+    /// right, upper right, upper left). DXIL's gather reads level 0 only,
+    /// so each texel is sampled at its centre at that level, through the
+    /// title's sampler: its addressing places texels past the edges as the
+    /// console's gather does. The level is the nearest to `lod` within the
+    /// view's levels; texel `offset` (x, y) moves the footprint. The
+    /// title's hierarchical-depth culling gathers its depth pyramid so.
+    // shortcut: a sampler with a minimum or maximum level of detail is not
+    // consulted for the level, and the console's rounding of a fractional
+    // `lod` with a linear mip filter is taken as the nearest level.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_at_level(
+        &mut self,
+        h: V,
+        sh: V,
+        kind: u32,
+        cs: &[V],
+        lod: V,
+        offset: [V; 2],
+        channel: u32,
+    ) -> Result<[V; 4], Why> {
+        // Two-dimensional views (and arrays of them) only.
+        if !matches!(kind, 2 | 7) {
+            return Err("a gather at an explicit level of a view not two-dimensional");
+        }
+        let c = self.cur;
+        let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
+        let i32t = self.s.t.i32;
+        let f32t = self.s.t.f32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        // The level: nearest, within 0..levels.
+        let zero_i = self.s.m.i32(0);
+        let all = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, zero_i]);
+        let levels = self.s.m.extract(c, all, 3);
+        let levels = self.s.m.cast(c, Cast::UiToFp, levels, f32t);
+        let (half, one) = (k(self, 0.5), k(self, 1.0));
+        let last = self.s.m.bin(c, Bin::Sub, levels, one);
+        let near = self.s.m.bin(c, Bin::Add, lod, half);
+        let near = self.unary(27, near);
+        // FMax, FMin (NaN takes the other operand: level 0).
+        let zero_f = k(self, 0.0);
+        let level = self.binary(35, near, zero_f);
+        let level = self.binary(36, level, last);
+        let level_i = self.s.m.cast(c, Cast::FpToUi, level, i32t);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, level_i]);
+        // Per axis: the centres of the footprint's two texels, normalized.
+        let mut centres = [[zero_f; 2]; 2];
+        for (axis, at) in centres.iter_mut().enumerate() {
+            let n = self.s.m.extract(c, d, axis as u32);
+            let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+            let x = self.s.m.bin(c, Bin::Mul, cs[axis], n);
+            let x = self.s.m.bin(c, Bin::Sub, x, half);
+            let first = self.unary(27, x);
+            let moved = self.s.m.cast(c, Cast::SiToFp, offset[axis], f32t);
+            let first = self.s.m.bin(c, Bin::Add, first, moved);
+            for (t, centre) in at.iter_mut().enumerate() {
+                let o = k(self, 0.5 + t as f32);
+                let x = self.s.m.bin(c, Bin::Add, first, o);
+                *centre = self.s.m.bin(c, Bin::SDiv, x, n);
+            }
+        }
+        let iu = self.s.m.undef(i32t);
+        // (column, row) per gathered value: (0, 1), (1, 1), (1, 0), (0, 0).
+        Ok([(0, 1), (1, 1), (1, 0), (0, 0)].map(|(i, j)| {
+            let mut args = vec![h, sh, centres[0][i], centres[1][j]];
+            args.extend(&cs[2..4]);
+            args.extend([zero_i, zero_i, iu, level]);
+            let r = self.s.op(
+                c,
+                "sampleLevel.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                62,
+                &args,
+            );
+            self.s.m.extract(c, r, channel)
+        }))
     }
 
     /// The direction a cube sample's face coordinates stand for: the
