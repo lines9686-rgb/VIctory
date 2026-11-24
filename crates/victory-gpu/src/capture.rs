@@ -103,6 +103,17 @@ pub(crate) fn read_back(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    read_back_subresource(device, list, texture, 0)
+}
+
+/// [`read_back`] of subresource `subresource` (a stencil plane's first,
+/// say).
+fn read_back_subresource(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    subresource: u32,
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -110,7 +121,7 @@ pub(crate) fn read_back(
         let desc = texture.GetDesc();
         device.GetCopyableFootprints(
             &desc,
-            0,
+            subresource,
             1,
             0,
             Some(&mut footprint),
@@ -161,7 +172,7 @@ pub(crate) fn read_back(
             pResource: std::mem::transmute_copy(texture),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
+                SubresourceIndex: subresource,
             },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
@@ -313,16 +324,27 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        let resource = *resource as crate::object::This;
+        dump_one(host, texture, state, (frame, i, 0), resource, &d);
+        // Depth with stencil: the stencil plane too (its first subresource
+        // follows all of the depth plane's), named `...-stencil`.
+        const STENCIL_FAMILIES: [u32; 2] = [19, 44];
+        if d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+            && STENCIL_FAMILIES.contains(&crate::resource::family(d.Format.0 as u32))
+        {
+            let plane = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
+            dump_one(host, texture, state, (frame, i, plane), resource, &d);
+        }
     }
 }
 
+/// Saves subresource `subresource` of a noted target, the `i`-th of frame
+/// `frame`.
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
     state: u32,
-    frame: u64,
-    i: usize,
+    (frame, i, subresource): (u64, usize, u32),
     resource: crate::object::This,
     d: &D3D12_RESOURCE_DESC,
 ) {
@@ -335,7 +357,7 @@ fn dump_one(
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        let read = read_back_subresource(&host.device, &list.list, texture, subresource);
         if state != copy {
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
@@ -356,8 +378,11 @@ fn dump_one(
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
+                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}{}",
+                d.Width,
+                d.Height,
+                d.Format.0,
+                if subresource == 0 { "" } else { "-stencil" }
             );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {

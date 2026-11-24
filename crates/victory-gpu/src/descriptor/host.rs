@@ -1188,6 +1188,37 @@ fn texture_srv_desc(
     view
 }
 
+/// Logs, once per kind, an unordered access view of a depth target: the
+/// title's texture format, the host's, the view's format and plane, and
+/// whether a twin serves it or its writes are dropped. Says which depth
+/// targets a run writes from shaders and which of those still lose it.
+fn note_depth_uav(resource: crate::object::This, view: u32, plane: u32, served: &'static str) {
+    /// Title format, host format, view format, plane, how it is served.
+    type Kind = (u32, u32, u32, u32, &'static str);
+    static SEEN: std::sync::Mutex<Vec<Kind>> = std::sync::Mutex::new(Vec::new());
+    let title = crate::resource::title_format(resource).unwrap_or(0);
+    let host = crate::resource::host_resource(resource).map_or(0, |t| {
+        // SAFETY: a live resource.
+        unsafe { t.GetDesc() }.Format.0 as u32
+    });
+    let key = (title, host, view, plane, served);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    drop(seen);
+    tracing::info!(
+        title,
+        host,
+        view,
+        plane,
+        served,
+        resource = format_args!("{resource:?}"),
+        "unordered access view of a depth target"
+    );
+}
+
 /// The unordered access view a null description makes of a 2D texture
 /// (twins are): mip 0, every array slice; the format is the caller's.
 fn whole_uav(texture: &ID3D12Resource) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -1279,11 +1310,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 });
             let twinned = crate::resource::host_unordered(resource, plane);
+            let asked = desc.as_ref().map_or(0, |d| uav_desc(d).Format.0 as u32);
             if twinned.is_none() && plane != 0 && crate::resource::host_copy(resource).is_some() {
                 once!(
                     plane,
                     "an unordered access view of a depth target's stencil plane without a twin"
                 );
+                note_depth_uav(resource, asked, plane, "dropped (no stencil twin)");
                 return None;
             }
             let Some((texture, twin_format)) = twinned else {
@@ -1302,10 +1335,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 use crate::resource::{DEPTH_FORMATS, family};
                 let d = desc.get_or_insert_with(|| whole_uav(texture));
                 let own = d.Format.0 as u32;
-                if own == 0 || own == family(format) || DEPTH_FORMATS.iter().any(|&(f, _)| f == own)
+                // The stencil's twin is R8: a view naming a stencil format
+                // of the depth's family (X24_TYPELESS_G8_UINT, say) or any
+                // other outside R8's takes R8_UINT.
+                const R8_UINT: u32 = 62;
+                let stencil_elsewhere = format == R8_UINT && family(own) != family(R8_UINT);
+                if own == 0
+                    || own == family(format)
+                    || DEPTH_FORMATS.iter().any(|&(f, _)| f == own)
+                    || stencil_elsewhere
                 {
                     d.Format.0 = format as i32;
                 }
+                note_depth_uav(resource, asked, plane, "twin");
                 // A twin has one plane: the view names plane 0 of it.
                 match d.ViewDimension {
                     D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice = 0,
@@ -1317,6 +1359,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             // SAFETY: a live host texture.
             let info = unsafe { texture.GetDesc() };
+            if twin_format.is_none() && info.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+                note_depth_uav(resource, asked, plane, "dropped (no twin)");
+            }
             if !fits(&info, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
