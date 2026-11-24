@@ -627,6 +627,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            self.pass_log(format_args!("dispatch {x}x{y}x{z} (skipped)"), false);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -637,6 +638,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
+            self.pass_log(format_args!("dispatch {x}x{y}x{z}"), false);
             return;
         };
         if !p.compute {
@@ -645,10 +648,14 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            self.pass_log(format_args!("dispatch {x}x{y}x{z} (not bound)"), false);
             return;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.pass_log(format_args!("dispatch {x}x{y}x{z}"), true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -708,11 +715,34 @@ impl State {
                 }
                 Err(_) => false,
             };
+        #[cfg(feature = "diagnostics")]
+        self.pass_log(format_args!("mesh {x}"), ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// In listed frames: one line per draw or dispatch with its pipeline,
+    /// render and depth targets, and the textures its tables bound since
+    /// the last line (target `victory_gpu::pass`, diagnostics builds).
+    #[cfg(feature = "diagnostics")]
+    fn pass_log(&self, what: std::fmt::Arguments, ran: bool) {
+        let io = PASS_IO.with(|v| std::mem::take(&mut *v.borrow_mut()));
+        if !pass_listed() {
+            return;
+        }
+        let name = crate::pipeline::host_pipeline(self.pipeline as This).map_or_else(
+            || format!("pipeline {:#x}", self.pipeline),
+            |p| p.name.clone(),
+        );
+        let mut rt: Vec<String> = self.targets.iter().map(|t| format!("{t:#x}")).collect();
+        if self.depth != 0 {
+            rt.push(format!("z {:#x}", self.depth));
+        }
+        let state = if ran { "ran" } else { "DROPPED" };
+        tracing::info!(target: "victory_gpu::pass", "{state} {what} {name} rt {rt:?} io {io:?}");
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -968,6 +998,11 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.pass_log(
+            format_args!("draw {vertices}x{instances} topology {}", self.topology),
+            ran,
+        );
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1094,6 +1129,8 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.pass_log(format_args!("indexed {indices}x{instances}"), ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1198,6 +1235,11 @@ impl State {
             },
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        self.pass_log(
+            format_args!("indirect kind {kind} max {max} rects {rects}"),
+            ran,
+        );
         if !ran {
             crate::indirect::done(list, &from);
             if rects {
@@ -1310,6 +1352,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
+            note_io('r', *resource as This);
+            #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -1325,10 +1369,44 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            #[cfg(feature = "diagnostics")]
+            note_io('w', *resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
     }
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Textures the draw or dispatch being prepared reads (`r`) and writes
+    /// through unordered access (`w`), in frames `VICTORY_CAPTURE_FRAMES`
+    /// lists (diagnostics builds).
+    static PASS_IO: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether the frame being recorded is one `VICTORY_CAPTURE_FRAMES` lists.
+#[cfg(feature = "diagnostics")]
+fn pass_listed() -> bool {
+    crate::capture::listed(crate::queue::presented() + 1)
+}
+
+/// Notes a texture view a pass binds, named as the target dumps name it.
+#[cfg(feature = "diagnostics")]
+fn note_io(dir: char, resource: This) {
+    if !pass_listed() {
+        return;
+    }
+    let Some(t) = crate::resource::host_resource(resource) else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { t.GetDesc() };
+    let what = format!(
+        "{dir} {:#x} {}x{} f{}",
+        resource as usize, d.Width, d.Height, d.Format.0
+    );
+    PASS_IO.with(|v| v.borrow_mut().push(what));
 }
 
 /// A view in a few words (diagnostics builds).
