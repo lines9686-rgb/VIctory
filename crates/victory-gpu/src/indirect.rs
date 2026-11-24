@@ -69,20 +69,62 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-struct Clamp {
+/// Rectangle-list draws, rewritten as the triangle-list draws of their
+/// expanded vertices (`draw::State::rectangles`: six per rectangle, from
+/// each of the first three vertices of the bound buffers on, one after the
+/// other: `2 * vertices` apart) into records of our own, so the title's
+/// records stay as they are. A record's rectangles are grouped from its
+/// first vertex on, which must stay within the `vertices` expanded
+/// (a multiple of 3), as must the rectangles; others draw nothing.
+/// The clamp's bound of 2^24 vertices holds for the triangles too.
+/// shortcut: the budget is charged the title's count, half the vertices
+/// the triangles run.
+const RECTANGLES: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
+cbuffer Record : register(b0) { uint stride; uint records; uint vertices; uint unused; };
+RWByteAddressBuffer args : register(u0);
+RWByteAddressBuffer triangles : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= records) return;
+    // Vertex count, instances, first vertex, first instance.
+    uint4 a = args.Load4(id.x * stride);
+    uint rects = min(a.x / 3, (1u << 24) / 6);
+    bool whole = a.z <= vertices && rects * 3 <= vertices - a.z;
+    uint first = a.z % 3 * vertices * 2 + a.z / 3 * 6;
+    triangles.Store4(id.x * 16, whole ? uint4(rects * 6, a.y, first, a.w) : uint4(0, 0, 0, 0));
+}
+"#;
+
+/// One of our compute passes: its root signature (inside the shader) and
+/// pipeline.
+struct Pass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
-unsafe impl Send for Clamp {}
+unsafe impl Send for Pass {}
 // SAFETY: as above.
-unsafe impl Sync for Clamp {}
+unsafe impl Sync for Pass {}
 
-fn clamp() -> Option<&'static Clamp> {
-    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+fn rectangle_pass() -> Option<&'static Pass> {
+    static PASS: std::sync::OnceLock<Option<Pass>> = std::sync::OnceLock::new();
+    PASS.get_or_init(|| match make(RECTANGLES, "rectangle pass") {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "no rectangle pass: indirect rectangles dropped");
+            None
+        }
+    })
+    .as_ref()
+}
+
+fn clamp() -> Option<&'static Pass> {
+    static CLAMP: std::sync::OnceLock<Option<Pass>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
+        .get_or_init(|| match make(SOURCE, "argument clamp") {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -92,16 +134,16 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
+fn make(source: &str, what: &str) -> windows::core::Result<Pass> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
+            source.as_ptr().cast(),
+            source.len(),
+            s!("victory"),
             None,
             None,
             s!("main"),
@@ -118,7 +160,7 @@ fn make() -> windows::core::Result<Clamp> {
             let text = unsafe {
                 std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
             };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+            tracing::warn!("{what}: {}", String::from_utf8_lossy(text));
         }
         return Err(e);
     }
@@ -135,7 +177,7 @@ fn make() -> windows::core::Result<Clamp> {
             },
             ..Default::default()
         })?;
-        Ok(Clamp { root, pso })
+        Ok(Pass { root, pso })
     }
 }
 
@@ -181,6 +223,51 @@ pub(crate) fn bound(
     true
 }
 
+/// Records, in `list`, the rewrite of `records` rectangle-list draw records
+/// `stride` bytes apart at host address `gpu` in `buffer` (bounded: read as
+/// arguments, and left so) into triangle-list records over the first
+/// `vertices` vertices expanded (see [`RECTANGLES`]): 16-byte records in
+/// the list's argument memory, ready to be read as arguments ([`done`] for
+/// both buffers after the execution). Replaces the list's compute root
+/// signature and pipeline. None, with nothing recorded, if the pass or the
+/// memory is not available.
+/// shortcut: at most 4,096 records (the list's argument memory comes in
+/// 64 KiB pieces); more are dropped.
+pub(crate) fn rectangles(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    (stride, records, vertices): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let p = rectangle_pass()?;
+    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) || stride < 16 {
+        return None;
+    }
+    let (out, offset) = list.argument_space(u64::from(records) * 16)?;
+    const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    const WRITE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let l = &list.list;
+    let constants = [stride, records, vertices, 0];
+    // SAFETY: an open list; our root signature, pipeline, the caller's live
+    // buffer and the list's own argument memory.
+    unsafe {
+        let to = out.GetGPUVirtualAddress() + offset;
+        l.ResourceBarrier(&[transition(buffer, READ, WRITE)]);
+        l.SetComputeRootSignature(&p.root);
+        l.SetPipelineState(&p.pso);
+        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRootUnorderedAccessView(1, gpu);
+        l.SetComputeRootUnorderedAccessView(2, to);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(buffer, WRITE, READ),
+            transition(&out, WRITE, READ),
+        ]);
+    }
+    Some((out, offset))
+}
+
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
@@ -213,5 +300,63 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// Rectangle records become records of their expanded triangles: six
+    /// vertices per rectangle, from the rectangle's own start. Records that
+    /// start inside a rectangle, or reach past the expanded vertices, draw
+    /// nothing; the title's records are left as they were.
+    #[test]
+    fn rectangle_records_become_triangle_records() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        // 20-byte records (4 bytes past the draw), 9 vertices expanded from
+        // each of the first three on: 18 triangle vertices apart.
+        let records: [[u32; 5]; 5] = [
+            [6, 2, 0, 1, 0xdead],
+            [7, 1, 3, 0, 0],
+            [3, 1, 1, 0, 0],
+            [3, 1, 5, 0, 0],
+            [3, 1, 9, 0, 0],
+        ];
+        let (input, data) = host.shared_buffer(100).unwrap();
+        // SAFETY: the buffer's mapping holds 100 bytes.
+        unsafe { data.cast::<[[u32; 5]; 5]>().write(records) };
+        let list = host.new_list().unwrap();
+        // SAFETY: a live buffer.
+        let gpu = unsafe { input.GetGPUVirtualAddress() };
+        assert!(super::bound(&list, &input, gpu, (0, 20, 5)));
+        let (out, offset) = super::rectangles(&list, &input, gpu, (20, 5, 9)).unwrap();
+        super::done(&list, &out);
+        super::done(&list, &input);
+        list.close();
+        host.execute(&[&list]);
+        let read = |buffer: &super::ID3D12Resource, at: u64| {
+            let mut p = std::ptr::null_mut();
+            // SAFETY: a mapped CPU-visible buffer holding the records read.
+            unsafe {
+                buffer.Map(0, None, Some(&mut p)).unwrap();
+                let v = p
+                    .cast::<u8>()
+                    .add(at as usize)
+                    .cast::<[[u32; 4]; 5]>()
+                    .read_unaligned();
+                buffer.Unmap(0, None);
+                v
+            }
+        };
+        assert_eq!(
+            read(&out, offset),
+            [
+                [12, 2, 0, 1],
+                [12, 1, 6, 0],
+                [6, 1, 18, 0],
+                [6, 1, 42, 0],
+                [0; 4]
+            ]
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { data.cast::<[[u32; 5]; 5]>().read() }, records);
     }
 }

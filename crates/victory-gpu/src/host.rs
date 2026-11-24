@@ -333,6 +333,8 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Memory shaders write indirect arguments to, reused after a reset.
+    arguments: Mutex<Arguments>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -410,6 +412,20 @@ struct Scratch {
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
 unsafe impl Send for Scratch {}
+
+/// Chunks of [`ARGUMENT_CHUNK`] bytes, the first `filled` in use, the last
+/// of them up to `used`.
+#[derive(Default)]
+struct Arguments {
+    chunks: Vec<ID3D12Resource>,
+    filled: usize,
+    used: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; used under the list's lock.
+unsafe impl Send for Arguments {}
+
+const ARGUMENT_CHUNK: u64 = 1 << 16;
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 
@@ -571,6 +587,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                arguments: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -986,6 +1003,10 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        {
+            let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+            (arguments.filled, arguments.used) = (0, 0);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1225,6 +1246,29 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// `len` bytes (at most 64 KiB) the list's shaders write and its
+    /// indirect executions read: a buffer and the offset in it, the list's
+    /// until it is reset. The buffer starts each submission in the common
+    /// state.
+    pub(crate) fn argument_space(&self, len: u64) -> Option<(ID3D12Resource, u64)> {
+        if len > ARGUMENT_CHUNK {
+            return None;
+        }
+        let mut a = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        if a.filled == 0 || a.used + len > ARGUMENT_CHUNK {
+            if a.filled == a.chunks.len() {
+                let (buffer, _) = host()?.shared_buffer(ARGUMENT_CHUNK)?;
+                name(&buffer, || "indirect arguments".into());
+                a.chunks.push(buffer);
+            }
+            a.filled += 1;
+            a.used = 0;
+        }
+        let at = a.used;
+        a.used += len.next_multiple_of(16);
+        Some((a.chunks[a.filled - 1].clone(), at))
     }
 
     /// Keeps `object` alive until the list is reset.
