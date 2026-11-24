@@ -211,8 +211,21 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 /// With `VICTORY_PRESENT_1440P` set: the latest `2560x1440` color render target
 /// (`f28`/`f29`/`f87`/`f91`) written during the current frame, substituted as
 /// plane 0 at present time when the title's `3840x2160` upscale pass outputs zero.
-static LAST_1440P: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
-    std::sync::Mutex::new(None);
+/// LOCAL: every such target of the frame, in first-use order;
+/// `VICTORY_PRESENT_1440P=<n>` (n >= 1) shows the n-th, 0 or anything else
+/// the latest written.
+static LAST_1440P: std::sync::Mutex<Vec<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn present_1440p_pick() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_1440P")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
 
 fn present_1440p_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -225,7 +238,21 @@ pub(crate) fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::Host
     if !present_1440p_on() {
         return None;
     }
-    LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()).take()
+    let list = std::mem::take(&mut *LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()));
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if list.len() > SEEN.fetch_max(list.len(), std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            candidates = list.len(),
+            pick = present_1440p_pick(),
+            "VICTORY_PRESENT_1440P: 2560x1440 colour targets in a frame"
+        );
+    }
+    let n = present_1440p_pick();
+    if n >= 1 {
+        list.get(n - 1).cloned().or_else(|| list.last().cloned())
+    } else {
+        list.last().cloned()
+    }
 }
 
 fn dump_on() -> bool {
@@ -249,7 +276,16 @@ pub(crate) fn note_target(resource: crate::object::This) {
             && d.Height == 1440
             && matches!(d.Format.0, 28 | 29 | 87 | 91)
         {
-            *LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+            let mut list = LAST_1440P.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = list.iter().position(|c| std::sync::Arc::ptr_eq(c, &copy)) {
+                // Keep first-use order; "latest" is the last one written.
+                if present_1440p_pick() == 0 {
+                    let c = list.remove(i);
+                    list.push(c);
+                }
+            } else {
+                list.push(copy);
+            }
         }
     }
     if !dump_on() || !listed(crate::queue::presented() + 1) {
