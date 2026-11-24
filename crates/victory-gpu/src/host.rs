@@ -342,6 +342,9 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Depth targets the list gave unordered access to since it last made
+    /// them current: their twins hold their contents until copied back.
+    twins: Mutex<Vec<HostCopy>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -371,6 +374,9 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+/// A title texture's host copy, as lists hold it.
+type HostCopy = std::sync::Arc<crate::resource::HostTexture>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -589,6 +595,7 @@ impl Host {
                 scratch: Mutex::default(),
                 arguments: Mutex::default(),
                 states: Mutex::default(),
+                twins: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -974,6 +981,13 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Lists end, and so start, with depth targets current, not twins.
+        let twins = std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()));
+        for depth in &twins {
+            if let Some(twin) = &depth.twin {
+                self.copy_texture(depth, twin);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -996,6 +1010,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1021,7 +1036,8 @@ impl HostList {
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
-    /// the texture there at submission.
+    /// the texture there at submission. A depth target with a twin is given
+    /// unordered access through the twin ([`HostList::sync_twin`]).
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
@@ -1029,17 +1045,90 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        if let Some(twin) = &copy.twin
+            && self.sync_twin(&copy, twin, wanted)
+        {
+            // Unordered access goes to the twin; the depth stays as it is.
+            return None;
+        }
         let wanted = legal_state(texture, wanted);
+        self.track(&copy, wanted).map(|before| (texture, before))
+    }
+
+    /// Notes that the list has `copy` in `wanted` from here on: the state it
+    /// leaves, if that is a change (none on the list's first use).
+    fn track(&self, copy: &HostCopy, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
+        }
+    }
+
+    /// [`HostList::track`], with the barrier to record if it is a change.
+    fn move_to(&self, copy: &HostCopy, wanted: u32) -> Option<D3D12_RESOURCE_BARRIER> {
+        let before = self.track(copy, wanted)?;
+        Some(transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        ))
+    }
+
+    /// Keeps a depth target and its unordered access twin coherent in this
+    /// list: unordered access (`wanted`) after other use copies the depth
+    /// into the twin, other use after unordered access copies the twin back
+    /// (as `close` does). Whether `wanted` is unordered access.
+    /// shortcut: a dispatch that also reads the depth through a shader view
+    /// readied after its unordered access view loses its writes (the read
+    /// copies the twin back first); whole-texture states cannot have both.
+    fn sync_twin(&self, depth: &HostCopy, twin: &HostCopy, wanted: u32) -> bool {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let unordered = wanted & UNORDERED_ACCESS != 0;
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let ahead = twins.iter().position(|d| std::sync::Arc::ptr_eq(d, depth));
+        match (unordered, ahead) {
+            (true, None) => {
+                twins.push(depth.clone());
+                drop(twins);
+                self.copy_texture(twin, depth);
+            }
+            (false, Some(i)) => {
+                twins.swap_remove(i);
+                drop(twins);
+                self.copy_texture(depth, twin);
+            }
+            _ => {}
+        }
+        if unordered && let Some(barrier) = self.move_to(twin, UNORDERED_ACCESS) {
+            // SAFETY: an open list and a live texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+        unordered
+    }
+
+    /// Records a copy of all of `src` into `dst` (a depth target and its
+    /// twin), with the transitions it needs.
+    fn copy_texture(&self, dst: &HostCopy, src: &HostCopy) {
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> =
+            [self.move_to(dst, COPY_DEST), self.move_to(src, COPY_SOURCE)]
+                .into_iter()
+                .flatten()
+                .collect();
+        // SAFETY: an open list and live textures, in the copy states by then.
+        unsafe {
+            if !barriers.is_empty() {
+                self.list.ResourceBarrier(&barriers);
+            }
+            self.list.CopyResource(&dst.texture, &src.texture);
         }
     }
 
