@@ -1179,3 +1179,73 @@ fn wave_allocation_by_the_last_lane_crosses_the_halves() {
         eprintln!("{name}: wave allocation exact (split {split})");
     }
 }
+
+/// A VGPR array indexed through M0 (v4..v7) whose second element the
+/// console compiler fills with a descriptor's address dword (s4, dword 0
+/// of the UAV's descriptor): lane t reads element 0, its own id.
+const ARRAY_FILLER: &[u32] = &[
+    0x7E08_0300, // v_mov_b32 v4, v0
+    0x7E0A_0204, // v_mov_b32 v5, s4
+    0x7E0C_0280, // v_mov_b32 v6, 0
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0xBEFC_0380, // s_mov_b32 m0, 0
+    0x7E04_8704, // v_movrels_b32 v2, v4
+];
+
+/// The same array rewritten first: element 1 gets the lane id through
+/// `v_movreld`, then lane t reads element 1.
+const ARRAY_FILLER_REWRITTEN: &[u32] = &[
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0x7E0A_0204, // v_mov_b32 v5, s4
+    0x7E0C_0280, // v_mov_b32 v6, 0
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0xBEFC_0381, // s_mov_b32 m0, 1
+    0x7E08_8500, // v_movreld_b32 v4, v0
+    0x7E04_8704, // v_movrels_b32 v2, v4
+];
+
+/// The address dword copied, then used as a number: still refused.
+const ADDRESS_AS_NUMBER: &[u32] = &[
+    0x7E0A_0204, // v_mov_b32 v5, s4
+    0x4A04_0105, // v_add_nc_u32 v2, v5, v0
+];
+
+/// An indexed array beside it, but the address dword copied below the
+/// array and added to its result: still refused.
+const ADDRESS_BESIDE_AN_ARRAY: &[u32] = &[
+    0x7E08_0300, // v_mov_b32 v4, v0
+    0x7E0A_0280, // v_mov_b32 v5, 0
+    0x7E0C_0280, // v_mov_b32 v6, 0
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0x7E06_0204, // v_mov_b32 v3, s4
+    0xBEFC_0380, // s_mov_b32 m0, 0
+    0x7E04_8704, // v_movrels_b32 v2, v4
+    0x4A04_0503, // v_add_nc_u32 v2, v3, v2
+];
+
+#[test]
+fn a_descriptor_dword_filling_an_indexed_array_reads_zero() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for body in [ARRAY_FILLER, ARRAY_FILLER_REWRITTEN] {
+        for target in [nvidia, super::Target::ANY] {
+            if let Err(e) = emit_for(&program(body, 64), target) {
+                panic!("{e}");
+            }
+        }
+    }
+    for body in [ADDRESS_AS_NUMBER, ADDRESS_BESIDE_AN_ARRAY] {
+        let refused = emit_for(&program(body, 64), nvidia)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("a descriptor's address or format read as data"),
+            "{refused}"
+        );
+    }
+    console_flow_case("array filler", ARRAY_FILLER, 64, |t| t);
+    console_flow_case("array filler rewritten", ARRAY_FILLER_REWRITTEN, 64, |t| t);
+}

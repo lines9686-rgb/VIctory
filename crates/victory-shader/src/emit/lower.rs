@@ -3537,12 +3537,112 @@ impl<'a> Lower<'a> {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        if self.only_array_filler(v) {
+                            let zero = self.s.m.i32(0);
+                            self.write(inst, Reg::S(code + k as u8), zero, None);
+                        } else {
+                            self.vals.insert(v, Val::Missing(OTHER));
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Whether `v`, a descriptor dword without a host value, is read as data
+    /// only to fill an element of a VGPR array that M0-relative moves
+    /// index: copied (`s_mov_b32` while the descriptor moves, joins, then
+    /// one `v_mov_b32`) into a VGPR at or above the first register of a
+    /// `v_movrels`/`v_movreld` range. Its other reads are the descriptor's
+    /// own, as a memory access's resource or sampler. The console compiler
+    /// gives array elements the program never sets whatever register is at
+    /// hand, a descriptor's dword among them; the program cannot rely on
+    /// those bits, so they read 0 here.
+    // shortcut: neither the index range nor the element's later reads are
+    // followed (inactive lanes keep it through other writes); a lane that
+    // does read it gets 0 where the console read address or format bits,
+    // which mean nothing on the host either.
+    fn only_array_filler(&self, v: Value) -> bool {
+        let p = self.x.p;
+        // A read of SGPR `code` as (part of) the instruction's descriptor.
+        let as_descriptor = |i: &Inst, code: u8| {
+            let within = |o: &Operand| {
+                matches!(*o, Operand::Scalar { code: c, dwords }
+                    if (u16::from(c)..u16::from(c) + u16::from(dwords)).contains(&u16::from(code)))
+            };
+            match &i.fields {
+                Fields::Buffer { rsrc, .. } => within(rsrc),
+                Fields::Image { rsrc, sampler, .. } => {
+                    within(rsrc) || sampler.as_ref().is_some_and(within)
+                }
+                Fields::Smem { base, .. } => i.name().starts_with("s_buffer_load") && within(base),
+                _ => false,
+            }
+        };
+        // The lowest register an M0-relative move reads or writes from.
+        let base =
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|i| {
+                    let Fields::Valu(f) = &i.fields else {
+                        return None;
+                    };
+                    let operand = match i.name() {
+                        "v_movrels_b32" => f.src.first(),
+                        "v_movreld_b32" => f.dst.as_ref(),
+                        "v_movrelsd_b32" => {
+                            f.src.first().into_iter().chain(f.dst.as_ref()).min_by_key(
+                                |o| match o {
+                                    Operand::Vector { reg, .. } => *reg,
+                                    _ => u8::MAX,
+                                },
+                            )
+                        }
+                        _ => None,
+                    };
+                    match operand {
+                        Some(&Operand::Vector { reg, .. }) => Some(reg),
+                        _ => None,
+                    }
+                })
+                .min();
+        let Some(base) = base else {
+            return false;
+        };
+        let mut seen = HashSet::from([v]);
+        let mut work = vec![v];
+        let mut filled = false;
+        while let Some(x) = work.pop() {
+            // Joins carry the copy on.
+            for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+                if phi.args.contains(&x) && seen.insert(phi.value) {
+                    work.push(phi.value);
+                }
+            }
+            for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+                let Some(&(reg, _)) = inst.reads.iter().find(|r| r.1 == x) else {
+                    continue;
+                };
+                let Reg::S(code) = reg else {
+                    return false;
+                };
+                match (inst.name(), inst.writes.as_slice()) {
+                    _ if as_descriptor(inst, code) => {}
+                    ("s_mov_b32", &[(Reg::S(c), w)])
+                        if c != EXEC && c != EXEC + 1 && c != crate::ir::M0 =>
+                    {
+                        if seen.insert(w) {
+                            work.push(w);
+                        }
+                    }
+                    ("v_mov_b32", &[(Reg::V(r), _)]) if r >= base => filled = true,
+                    _ => return false,
+                }
+            }
+        }
+        filled
     }
 
     /// `s_load_dword*` from the program's constant table.
