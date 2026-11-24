@@ -798,6 +798,11 @@ impl State {
         tracing::info!(target: "victory_gpu::pass", "{state} {what} {name} rt {rt:?} io {io:?}");
     }
 
+    /// Whether the bound pipeline completes rectangles in a geometry stage.
+    fn rect_gs(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rect_gs)
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -1032,9 +1037,12 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
-        let ran =
-            self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first, 1));
+        let prepared = self.prepare(list, false);
+        // A pipeline with a rectangle geometry stage takes the title's
+        // vertices as they are (asked once prepared: a pipeline made on
+        // another thread may have become ready meanwhile).
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
+        let ran = prepared && (!rects || self.rectangles(list, vertices, first, 1));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -1053,7 +1061,11 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         self.pass_log(
-            format_args!("draw {vertices}x{instances} topology {}", self.topology),
+            format_args!(
+                "draw {vertices}x{instances} topology {} rect gs {}",
+                self.topology,
+                self.topology == RECTANGLES && !rects
+            ),
             ran,
         );
         if !ran {
@@ -1074,6 +1086,11 @@ impl State {
     fn rectangle_vertices(&self) -> Option<u32> {
         const EXPANDED: u32 = 4 << 20;
         let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        // Its geometry stage takes the title's records (a pipeline that
+        // became ready since the draw asked is not expanded).
+        if p.rect_gs {
+            return None;
+        }
         let mut vertices = 1 << 24;
         for e in p.inputs.iter().filter(|e| !e.per_instance) {
             let v = self.vertex[e.slot as usize];
@@ -1253,8 +1270,10 @@ impl State {
         }
         // Rectangles: the draws of their expanded vertices, from records of
         // our own; the title's stay as they are (and hold the count, if the
-        // title keeps it beside them).
-        let rects = kind == DRAW && self.topology == RECTANGLES;
+        // title keeps it beside them). A pipeline with a rectangle geometry
+        // stage runs the title's records as they are.
+        let gs = kind == DRAW && self.topology == RECTANGLES && self.rect_gs();
+        let rects = kind == DRAW && self.topology == RECTANGLES && !gs;
         let (mut from, mut at, mut signature) =
             (args.buffer.clone(), args.offset(arguments), signature);
         let mut expanded = 0;
@@ -1280,7 +1299,11 @@ impl State {
         self.host_roots[1] = 0;
         let ran = match kind {
             DRAW if rects => self.prepare(list, false) && self.rectangles(list, expanded, 0, 3),
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            // Rectangles a geometry stage completes run the title's records;
+            // indexed ones stay undrawn.
+            DRAW | INDEXED => {
+                (self.topology != RECTANGLES || gs) && self.prepare(list, kind == INDEXED)
+            }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1290,7 +1313,7 @@ impl State {
         };
         #[cfg(feature = "diagnostics")]
         self.pass_log(
-            format_args!("indirect kind {kind} max {max} rects {rects}"),
+            format_args!("indirect kind {kind} max {max} rects {rects} rect gs {gs}"),
             ran,
         );
         if !ran {
