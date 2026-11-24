@@ -2358,6 +2358,20 @@ impl<'a> Lower<'a> {
 
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
+            // LOCAL port of Peppacodes' ed9afc0 (VIctory #940) onto #439: on
+            // a host without 64-lane waves, lane masks come from ballots over
+            // the 32-lane host wave, so number lanes the host's way too.
+            if self.x.native.wave64 && !self.x.target.runs(64) {
+                self.s.flags |= flags::WAVE_OPS;
+                return self.s.op(
+                    self.cur,
+                    "waveGetLaneIndex",
+                    Attr::ReadOnly,
+                    self.s.t.i32,
+                    111,
+                    &[],
+                );
+            }
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
             let f = self.mesh_thread();
