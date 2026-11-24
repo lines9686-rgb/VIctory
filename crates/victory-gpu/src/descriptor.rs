@@ -206,13 +206,23 @@ impl RtvRecord {
         self.host_desc(TEXTURE_2D)
     }
 
-    /// The depth view description in the host's type (the same layout).
+    /// The depth view description in the host's type (the same layout). A
+    /// view of 16-bit depth (also the console's with stencil as host D16,
+    /// `resource::d16_depth`) has no stencil to keep read-only.
     #[cfg(windows)]
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_DEPTH_STENCIL_VIEW_DESC, D3D12_DSV_FLAG_READ_ONLY_STENCIL,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D16_UNORM;
         const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        let mut desc: D3D12_DEPTH_STENCIL_VIEW_DESC = self.host_desc(TEXTURE_2D)?;
+        if desc.Format == DXGI_FORMAT_D16_UNORM {
+            desc.Flags &= !D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+        }
+        Some(desc)
     }
 
     /// The description words as a host type, the format as the host has it.

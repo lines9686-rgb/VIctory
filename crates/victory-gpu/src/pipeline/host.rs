@@ -307,6 +307,10 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// The depth view format it draws with (unknown for compute) and
+    /// whether it tests or writes the stencil.
+    pub(crate) depth_format: DXGI_FORMAT,
+    pub(crate) stencil: bool,
 }
 
 /// Whether a `stage` program (`wave64`: written for 64-lane waves) cannot
@@ -609,6 +613,8 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                depth_format: DXGI_FORMAT_UNKNOWN,
+                stencil: false,
             });
         }
         let Some(g) = g else {
@@ -641,6 +647,8 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                depth_format: g.depth_format,
+                stencil: g.depth.StencilEnable.as_bool(),
             });
         }
 
@@ -711,6 +719,8 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            depth_format: g.depth_format,
+            stencil: g.depth.StencilEnable.as_bool(),
         })
     }
 }

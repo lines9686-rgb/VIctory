@@ -20,6 +20,11 @@
 //!
 //! shortcut: one subresource (no mips, no array slices); other such
 //! targets get no 16-bit twin and their depth-plane writes are dropped.
+//!
+//! With `VICTORY_LOCAL_D16_DEPTH=1` (`resource::d16_depth`) the console's
+//! 16-bit depth is a D16 target on the host instead: its twin is copied as
+//! other 16-bit depth twins are, no pass runs, and its stencil lives in an
+//! R8 texture of its own, cleared through the views here ([`Clears`]).
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -416,4 +421,137 @@ pub(crate) fn to_twin(list: &HostList, views: &Views, twin: &ID3D12Resource) {
         }]);
     }
     list.clobber();
+}
+
+/// The views clears of a stencil kept apart go through (the console's
+/// 16-bit depth as host D16, `resource::d16_depth`): an R8_UINT unordered
+/// access view of each mip (every array slice), in a shader-visible heap
+/// and again in a CPU-only one, as ClearUnorderedAccessViewUint takes them.
+pub(crate) struct Clears {
+    visible: ID3D12DescriptorHeap,
+    cpu: ID3D12DescriptorHeap,
+    increment: u32,
+    mips: u32,
+}
+
+impl Clears {
+    /// The views for `stencil` (R8_TYPELESS, unordered access).
+    pub(crate) fn new(stencil: &ID3D12Resource) -> Option<Clears> {
+        let device = &host()?.device;
+        // SAFETY: a live resource.
+        let d = unsafe { stencil.GetDesc() };
+        let (mips, slices) = (u32::from(d.MipLevels), u32::from(d.DepthOrArraySize));
+        let heap = |flags| {
+            // SAFETY: plain creation.
+            unsafe {
+                device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: mips,
+                    Flags: flags,
+                    NodeMask: 0,
+                })
+            }
+            .inspect_err(|e| tracing::warn!(error = %e, "no views to clear a stencil kept apart"))
+            .ok()
+        };
+        let visible = heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
+        let cpu = heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?;
+        // SAFETY: a plain query.
+        let increment = unsafe {
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        let clears = Clears {
+            visible,
+            cpu,
+            increment,
+            mips,
+        };
+        for mip in 0..mips {
+            let mut uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R8_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            if slices > 1 {
+                uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                uav.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                    MipSlice: mip,
+                    ArraySize: slices,
+                    ..Default::default()
+                };
+            } else {
+                uav.Anonymous.Texture2D = D3D12_TEX2D_UAV {
+                    MipSlice: mip,
+                    PlaneSlice: 0,
+                };
+            }
+            let counter = None::<&ID3D12Resource>;
+            for at in [
+                clears.cpu_at(&clears.visible, mip),
+                clears.cpu_at(&clears.cpu, mip),
+            ] {
+                // SAFETY: a live texture and a slot of our heap.
+                unsafe {
+                    device.CreateUnorderedAccessView(stencil, counter, Some(&raw const uav), at)
+                };
+            }
+        }
+        crate::host::name(&clears.visible, || {
+            "views to clear a stencil kept apart".into()
+        });
+        Some(clears)
+    }
+
+    fn cpu_at(&self, heap: &ID3D12DescriptorHeap, slot: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        // SAFETY: a heap of ours.
+        let mut handle = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        handle.ptr += (slot * self.increment) as usize;
+        handle
+    }
+
+    /// Records, in `list`, mip `mip` of `stencil` (every slice; in
+    /// unordered access) cleared to `value` within `rects` (all of it for
+    /// none), then an unordered access barrier on it. Leaves descriptor
+    /// heaps of its own, which the title's next draw or dispatch binds again
+    /// (`HostList::clobber`).
+    /// shortcut: a clear of some of a mip's array slices clears them all.
+    pub(crate) fn clear(
+        &self,
+        list: &HostList,
+        stencil: &ID3D12Resource,
+        mip: u32,
+        value: u8,
+        rects: &[RECT],
+    ) {
+        if mip >= self.mips {
+            return;
+        }
+        // SAFETY: a shader-visible heap of ours.
+        let mut gpu = unsafe { self.visible.GetGPUDescriptorHandleForHeapStart() };
+        gpu.ptr += u64::from(mip * self.increment);
+        // SAFETY: an open list; our heaps' views of a live texture in the
+        // unordered access state.
+        unsafe {
+            let l = &list.list;
+            l.SetDescriptorHeaps(&[Some(self.visible.clone())]);
+            l.ClearUnorderedAccessViewUint(
+                gpu,
+                self.cpu_at(&self.cpu, mip),
+                stencil,
+                &[u32::from(value); 4],
+                rects,
+            );
+            l.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        // A borrowed pointer; the barrier never releases it.
+                        pResource: std::mem::transmute_copy(stencil),
+                    }),
+                },
+            }]);
+        }
+        list.clobber();
+    }
 }

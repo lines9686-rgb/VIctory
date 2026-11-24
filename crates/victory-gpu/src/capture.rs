@@ -325,21 +325,28 @@ pub(crate) fn dump_targets(frame: u64) {
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         let resource = *resource as crate::object::This;
-        dump_one(host, texture, state, (frame, i, 0), resource, &d);
+        dump_one(host, texture, state, (frame, i, 0), resource, &d, "");
         // Depth with stencil: the stencil plane too (its first subresource
-        // follows all of the depth plane's), named `...-stencil`.
+        // follows all of the depth plane's), named `...-stencil`; a stencil
+        // kept apart (the console's 16-bit depth as host D16) from its own
+        // texture.
         const STENCIL_FAMILIES: [u32; 2] = [19, 44];
-        if d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        if let Some(stencil) = copy.stencil.as_ref().filter(|_| copy.stencil_alone) {
+            let state = stencil.state.load(Relaxed);
+            let at = (frame, i, 0);
+            dump_one(host, &stencil.texture, state, at, resource, &d, "-stencil");
+        } else if d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
             && STENCIL_FAMILIES.contains(&crate::resource::family(d.Format.0 as u32))
         {
             let plane = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
-            dump_one(host, texture, state, (frame, i, plane), resource, &d);
+            let at = (frame, i, plane);
+            dump_one(host, texture, state, at, resource, &d, "-stencil");
         }
     }
 }
 
-/// Saves subresource `subresource` of a noted target, the `i`-th of frame
-/// `frame`.
+/// Saves subresource `subresource` of `texture`, of the noted target the
+/// `i`-th of frame `frame` (description `d`), its name ending in `suffix`.
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -347,6 +354,7 @@ fn dump_one(
     (frame, i, subresource): (u64, usize, u32),
     resource: crate::object::This,
     d: &D3D12_RESOURCE_DESC,
+    suffix: &str,
 ) {
     let Ok(list) = host.new_list() else { return };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
@@ -376,13 +384,17 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        // 16-bit depth (typeless when shaders read it) is UNORM.
+        const R16_TYPELESS: u32 = 53;
+        const R16_UNORM: u32 = 56;
+        let format = match f.Format.0 as u32 {
+            R16_TYPELESS if d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) => R16_UNORM,
+            other => other,
+        };
+        if let Some(rgba) = to_rgba(format, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}{}",
-                d.Width,
-                d.Height,
-                d.Format.0,
-                if subresource == 0 { "" } else { "-stencil" }
+                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}{suffix}",
+                d.Width, d.Height, d.Format.0,
             );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {

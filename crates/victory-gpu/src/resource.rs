@@ -227,14 +227,56 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 }
 
 /// A format as the host has it. The console's 16-bit depth with stencil
-/// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// (and its typeless views) has no PC format: the 24-bit ones stand in,
+/// or with [`d16_depth`] 16-bit depth (D16_UNORM, R16_UNORM) and, for the
+/// stencil, R8_UINT (a texture of its own).
 pub(crate) fn pc_format(format: u32) -> u32 {
-    match format {
-        118 => 45,
-        119 => 46,
-        120 => 47,
-        other => other,
+    if !(118..=120).contains(&format) {
+        return format;
     }
+    let (d24, d16) = match format {
+        118 => (45, 55),
+        119 => (46, 56),
+        _ => (47, 62),
+    };
+    if d16_depth() { d16 } else { d24 }
+}
+
+/// Whether the console's 16-bit depth with stencil (title formats 118-120)
+/// is 16-bit depth on the host too (`VICTORY_LOCAL_D16_DEPTH=1`; in tests,
+/// per thread: [`D16_FOR_TEST`]): D16_UNORM, which stores the depth a draw
+/// rasterizes and the title's 16-bit writes at the same 16-bit values, as
+/// the console does (draws testing depth equal pass where they did there),
+/// with the stencil in an R8 texture of its own
+/// (`HostTexture::stencil_alone`) that draws cannot test. Else D24S8, its
+/// depth plane written from the title's 16-bit views by passes of ours
+/// (`crate::depth_twin`).
+/// LOCAL: a switch to compare the two in the title; drop it (or the D24S8
+/// way) once one is proven.
+pub(crate) fn d16_depth() -> bool {
+    #[cfg(test)]
+    {
+        D16_FOR_TEST.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var("VICTORY_LOCAL_D16_DEPTH").is_ok_and(|v| v == "1");
+            tracing::info!(
+                on,
+                "the console's 16-bit depth with stencil as host D16, the stencil apart (VICTORY_LOCAL_D16_DEPTH)"
+            );
+            on
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`d16_depth`] for the tests on this thread (their resources, views
+    /// and pipelines are made on it).
+    pub(crate) static D16_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The typeless format of a format's family (itself if it has none).
@@ -776,36 +818,38 @@ impl Resource {
                 let twin = twinned
                     .then(|| host_twin(&texture, self.desc.format))
                     .flatten()
-                    .map(|texture| {
+                    .map(HostTexture::plain);
+                // The console's 16-bit depth as host D16 keeps its stencil
+                // apart, whether or not the title writes it as unordered
+                // access.
+                const DEPTH: u32 = 2;
+                let alone = self.desc.flags & DEPTH != 0
+                    && SIXTEEN_BIT_WITH_STENCIL.contains(&self.desc.format)
+                    && d16_depth();
+                let stencil = if alone {
+                    host_stencil_twin(&texture, true).map(|stencil| {
+                        let clears = crate::depth_twin::Clears::new(&stencil);
                         std::sync::Arc::new(HostTexture {
-                            texture,
-                            state: 0.into(),
-                            twin: None,
-                            stencil: None,
-                            planes: None,
+                            clears,
+                            ..HostTexture::new(stencil)
                         })
-                    });
-                let stencil = twinned
-                    .then(|| host_stencil_twin(&texture))
-                    .flatten()
-                    .map(|texture| {
-                        std::sync::Arc::new(HostTexture {
-                            texture,
-                            state: 0.into(),
-                            twin: None,
-                            stencil: None,
-                            planes: None,
-                        })
-                    });
+                    })
+                } else {
+                    twinned
+                        .then(|| host_stencil_twin(&texture, false))
+                        .flatten()
+                        .map(HostTexture::plain)
+                };
                 let planes = twin
                     .as_ref()
                     .and_then(|t| crate::depth_twin::Views::new(&texture, &t.texture));
                 Some(std::sync::Arc::new(HostTexture {
-                    texture,
                     state: state.into(),
                     twin,
+                    stencil_alone: alone && stencil.is_some(),
                     stencil,
                     planes,
+                    ..HostTexture::new(texture)
                 }))
             })
             .as_ref()
@@ -829,11 +873,41 @@ pub(crate) struct HostTexture {
     /// The twin of a depth target's stencil plane ([`host_stencil_twin`]),
     /// which unordered access views of plane 1 name.
     pub(crate) stencil: Option<std::sync::Arc<HostTexture>>,
+    /// Whether `stencil` is the only stencil there is, not a twin: the
+    /// console's 16-bit depth with stencil as host D16 ([`d16_depth`]).
+    /// Shader views of the stencil, unordered access to it, its clears and
+    /// copies go to it; nothing copies it to or from the depth target.
+    pub(crate) stencil_alone: bool,
     /// With a `twin` of fewer bits than the depth plane (16 for the
     /// console's depth with stencil, 24 on the host): the views the passes
     /// that move the depth between the two use (`crate::depth_twin`), as
     /// copies cannot.
     pub(crate) planes: Option<crate::depth_twin::Views>,
+    /// For a stencil kept apart: the views its clears go through.
+    pub(crate) clears: Option<crate::depth_twin::Clears>,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    /// `texture` in the common state, without twins or views of its own.
+    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> HostTexture {
+        HostTexture {
+            texture,
+            state: 0.into(),
+            twin: None,
+            stencil: None,
+            stencil_alone: false,
+            planes: None,
+            clears: None,
+        }
+    }
+
+    /// A twin: [`HostTexture::new`], shared.
+    fn plain(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    ) -> std::sync::Arc<HostTexture> {
+        std::sync::Arc::new(HostTexture::new(texture))
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -890,6 +964,24 @@ pub(crate) fn host_unordered<'a>(
         .find(|&&(f, _)| f == typeless)
         .map(|&(_, f)| f);
     Some((&twin.texture, format))
+}
+
+/// The stencil of a title texture whose host copy keeps it apart (the
+/// console's 16-bit depth with stencil as host D16, [`d16_depth`]): an
+/// R8_TYPELESS texture of the depth's size, mips and slices, which shader
+/// views of the stencil name.
+#[cfg(windows)]
+pub(crate) fn host_stencil<'a>(
+    this: This,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if this.is_null() {
+        return None;
+    }
+    let host = resource(this).host()?;
+    host.stencil
+        .as_ref()
+        .filter(|_| host.stencil_alone)
+        .map(|s| &s.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1017,7 +1109,8 @@ const STENCIL_FAMILIES: [u32; 2] = [19, 44];
 /// views' formats), a D24S8 target on the host (`pc_format`): its depth
 /// plane's twin is R16_TYPELESS, the console's bits, which the title's
 /// 16-bit views name; passes of ours move them to the 24-bit plane and
-/// back (`crate::depth_twin`).
+/// back (`crate::depth_twin`). With [`d16_depth`] it is a D16 target with
+/// its stencil apart instead, and its twin is a plain 16-bit one.
 #[cfg(windows)]
 const SIXTEEN_BIT_WITH_STENCIL: std::ops::RangeInclusive<u32> = 118..=120;
 
@@ -1041,10 +1134,12 @@ pub(crate) fn has_stencil_twin(this: This) -> bool {
 
 /// A twin for unordered access to the stencil plane of host depth target
 /// `depth`: R8_TYPELESS, its size, mips and slices. Copies between them
-/// move plane 1 (`HostList::copy_texture`).
+/// move plane 1 (`HostList::copy_texture`). With `alone`, the stencil of a
+/// depth target that has none on the host (`HostTexture::stencil_alone`).
 #[cfg(windows)]
 fn host_stencil_twin(
     depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    alone: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     let host = crate::host::host()?;
@@ -1052,8 +1147,17 @@ fn host_stencil_twin(
     let mut d = unsafe { depth.GetDesc() };
     if d.SampleDesc.Count > 1
         || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        || !STENCIL_FAMILIES.contains(&family(d.Format.0 as u32))
+        || !alone && !STENCIL_FAMILIES.contains(&family(d.Format.0 as u32))
     {
+        if alone {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    samples = d.SampleDesc.Count,
+                    "the console's 16-bit depth as host D16 without a stencil: its stencil is lost"
+                )
+            });
+        }
         return None;
     }
     d.Format.0 = 60;
@@ -3605,6 +3709,528 @@ float4 main() : SV_Target { return float4(1, id, 0, 0) / 255; }
                 );
             }
         }
+    }
+
+    /// What [`console_equivalent_depths`] found: per form of the draws'
+    /// depth, the texels its draws did not pass as on the console, and the
+    /// texels the probe read other than written (each described).
+    #[cfg(windows)]
+    struct Found {
+        misses: [Vec<String>; 2],
+        probe: Vec<String>,
+    }
+
+    /// The console's 16-bit depth with stencil (title format 118) written by
+    /// the title's compute shader through an R16_UNORM view of plane 0 and
+    /// tested by draws whose vertex shaders put each value's depth where the
+    /// console's 16 bits hold it, but not at the float the twin's value
+    /// reads as (as the title's tiled lighting need not): form 0 at
+    /// `float(k) * (1.0 / 65535.0)`, form 1 at `(k + 0.25) / 65535` (`k -
+    /// 0.25` for 65535, inside the depth range). Depth equal, no depth
+    /// writes, no stencil, as the title's lighting draws. On the console
+    /// each value's draws pass exactly where it was written; on the host
+    /// that takes 16-bit depth (`d16`, [`d16_depth`]): D24 stores form 1's
+    /// depth 64 steps from the written one's.
+    ///
+    /// The first list clears depth (to one of the values, `CLEARED`) and
+    /// stencil (0x5a) through the title's depth view, then writes columns
+    /// 0-6 of the depth and the stencil of column 6 (0x33, through an
+    /// R8_UINT view of plane 1); the second binds the draws' targets (the
+    /// title's depth view keeps the stencil read-only) and draws each value
+    /// in both forms, each adding 1 and its number to its form's channels.
+    /// Unless the target is denied shader resources (`readable` false), a
+    /// probe then reads the depth plane and the stencil through the title's
+    /// shader views (R16_UNORM_X8_TYPELESS, X16_TYPELESS_G8_UINT of plane
+    /// 1). `None` without a host GPU.
+    #[cfg(windows)]
+    fn console_equivalent_depths(d16: bool, readable: bool) -> Option<Found> {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::s;
+        const VALUES: [u32; 8] = [0, 1, 128, 129, 25828, 51529, 65534, 65535];
+        const CLEARED: usize = 5;
+        const STENCIL: u32 = 0x5a;
+        const WRITTEN: u32 = 0x33;
+        const DEPTH_WRITE: u32 = 0x10;
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        const COPY_SOURCE: u32 = 0x800;
+        let host = crate::host::host()?;
+        /// Sets [`D16_FOR_TEST`] back as it drops.
+        struct Back;
+        impl Drop for Back {
+            fn drop(&mut self) {
+                D16_FOR_TEST.with(|on| on.set(false));
+            }
+        }
+        D16_FOR_TEST.with(|on| on.set(d16));
+        let _back = Back;
+        let device = &host.device;
+        let null: This = std::ptr::null();
+        let made = |desc: &ResourceDesc, state| {
+            let mut resource = null;
+            let iid = &RESOURCE_IIDS[0];
+            let made = create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                desc,
+                state,
+                null.cast(),
+                iid,
+                &mut resource,
+            );
+            assert_eq!(made, S_OK);
+            resource
+        };
+        const DENY_SHADER_RESOURCE: u32 = 8;
+        let deny = if readable { 0 } else { DENY_SHADER_RESOURCE };
+        let target = made(
+            &ResourceDesc {
+                flags: 2 | 4 | deny,
+                ..texture(8, 8, 118, 1)
+            },
+            DEPTH_WRITE,
+        );
+        // What the probe writes: R32_UINT.
+        let probed = made(
+            &ResourceDesc {
+                flags: 4,
+                ..texture(8, 8, 42, 1)
+            },
+            UNORDERED_ACCESS,
+        );
+        // SAFETY: a live resource.
+        let host_format = unsafe { host_resource(target).unwrap().GetDesc() }.Format;
+        let wanted_format = match (d16, readable) {
+            (true, true) => DXGI_FORMAT_R16_TYPELESS,
+            (true, false) => DXGI_FORMAT_D16_UNORM,
+            (false, true) => DXGI_FORMAT_R24G8_TYPELESS,
+            (false, false) => DXGI_FORMAT_D24_UNORM_S8_UINT,
+        };
+        assert_eq!(host_format, wanted_format, "the host's depth format");
+        assert_eq!(host_stencil(target).is_some(), d16, "a stencil apart");
+
+        // The title's depth views: to clear, and the draws' (stencil
+        // read-only), recorded as `CreateDepthStencilView` records them.
+        let mut slots = [[0u64; 16]; 2];
+        for (slot, flags) in slots.iter_mut().zip([0, 2]) {
+            let words = [118, 3, flags, 0, 0, 0];
+            crate::descriptor::create_dsv(null, target, &words, slot.as_mut_ptr() as u64);
+        }
+        let [clear_view, draw_view] =
+            slots.map(|slot| crate::descriptor::dsv_record(slot.as_ptr() as u64).unwrap());
+
+        // The title's compute shader: the values to columns 0-6, the
+        // stencil of column 6.
+        let fill_views = crate::descriptor::host::HostHeap::new(false, 2).unwrap();
+        let depth_uav = [56, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let stencil_uav = [62, 4, 0, 1, 0, 0, 0, 0, 0, 0];
+        for (slot, words) in (0..).zip([depth_uav, stencil_uav]) {
+            let view = crate::descriptor::View::Unordered(target as usize, 0, Some(words));
+            fill_views.make_at(slot, &view);
+        }
+        let values = VALUES.map(|v| v.to_string()).join(", ");
+        let fill = format!(
+            r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=2))"
+RWTexture2D<unorm float> depth : register(u0);
+RWTexture2D<uint> stencil : register(u1);
+static const uint VALUES[8] = {{ {values} }};
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    if (id.x < 7) depth[id.xy] = VALUES[(id.x + id.y) % 8] / 65535.0;
+    if (id.x == 6) stencil[id.xy] = {WRITTEN};
+}}
+"#
+        );
+        // The probe: the depth plane as 16 bits, the stencil above them.
+        const PROBE: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0))"
+Texture2D<float> depth : register(t0);
+Texture2D<uint2> stencil : register(t1);
+RWTexture2D<uint> probed : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    probed[id.xy] = uint(depth.Load(at) * 65535.0 + 0.5) | stencil.Load(at).g << 16;
+}
+"#;
+        let compute = |source: &str| {
+            let code = compiled(source, s!("cs_5_1"));
+            // SAFETY: the shader's bytes, the root signature inside.
+            unsafe {
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).unwrap();
+                let pso: ID3D12PipelineState = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: code.as_ptr().cast(),
+                            BytecodeLength: code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        };
+        let (fill_root, fill_pso) = compute(&fill);
+        let (probe_root, probe_pso) = compute(PROBE);
+        let probe_views = crate::descriptor::host::HostHeap::new(false, 3).unwrap();
+        if readable {
+            // The title's shader views, in the default mapping.
+            const MAPPING: u32 = 0x1688;
+            let depth_srv = [119, 4, MAPPING, 0, 0, 1, 0, 0, 0, 0];
+            let stencil_srv = [120, 4, MAPPING, 0, 0, 1, 1, 0, 0, 0];
+            for (slot, words) in (0..).zip([depth_srv, stencil_srv]) {
+                let view = crate::descriptor::View::Shader(target as usize, Some(words));
+                probe_views.make_at(slot, &view);
+            }
+            let view = crate::descriptor::View::Unordered(probed as usize, 0, None);
+            probe_views.make_at(2, &view);
+        }
+
+        // The draws: one triangle over the target at value `k`'s depth in
+        // form `form`, adding 1 and `id` to the form's two channels where
+        // the depth test passes.
+        const DRAW: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0)"
+cbuffer Draw : register(b0) { uint k; uint form; uint id; };
+[RootSignature(RS)]
+float4 main(uint vertex : SV_VertexID) : SV_Position {
+    float2 uv = float2((vertex << 1) & 2, vertex & 2);
+    float off = k == 65535 ? -0.25 : 0.25;
+    float depth = form == 0 ? float(k) * (1.0 / 65535.0) : (float(k) + off) / 65535.0;
+    return float4(uv * float2(2, -2) + float2(-1, 1), depth, 1);
+}
+"#;
+        const COUNT: &str = r#"
+cbuffer Draw : register(b0) { uint k; uint form; uint id; };
+float4 main() : SV_Target {
+    return (form == 0 ? float4(1, id, 0, 0) : float4(0, 0, 1, id)) / 255;
+}
+"#;
+        let (vs, ps) = (compiled(DRAW, s!("vs_5_1")), compiled(COUNT, s!("ps_5_1")));
+        // SAFETY: the shaders' bytes, the root signature inside the vertex
+        // shader; the description points at live data.
+        let (draw_root, draw_pso) = unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs).unwrap();
+            let mut blend = D3D12_BLEND_DESC::default();
+            blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D12_BLEND_ONE,
+                DestBlend: D3D12_BLEND_ONE,
+                BlendOp: D3D12_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D12_BLEND_ONE,
+                DestBlendAlpha: D3D12_BLEND_ONE,
+                BlendOpAlpha: D3D12_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                ..Default::default()
+            };
+            let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+            formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.as_ptr().cast(),
+                    BytecodeLength: vs.len(),
+                },
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
+                },
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: true.into(),
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                    DepthFunc: D3D12_COMPARISON_FUNC_EQUAL,
+                    StencilEnable: false.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: formats,
+                // The title's pipeline's depth format, as the host takes it.
+                DSVFormat: DXGI_FORMAT(pc_format(118) as i32),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc).unwrap();
+            (root, pso)
+        };
+
+        // The color target (ours) and the read-back buffer: the color's 8
+        // rows of 256 bytes, then the probe's.
+        let color_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        const PROBED_AT: usize = 8 * 256;
+        let read_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 2 * 8 * 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let (mut color, mut readback) = (None::<ID3D12Resource>, None::<ID3D12Resource>);
+        // SAFETY: plain creation; out pointers ours.
+        unsafe {
+            let memory = |kind| D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            let none = D3D12_HEAP_FLAG_NONE;
+            device
+                .CreateCommittedResource(
+                    &memory(D3D12_HEAP_TYPE_DEFAULT),
+                    none,
+                    &color_desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut color,
+                )
+                .unwrap();
+            device
+                .CreateCommittedResource(
+                    &memory(D3D12_HEAP_TYPE_READBACK),
+                    none,
+                    &read_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let (color, readback) = (color.unwrap(), readback.unwrap());
+        // `texture`'s 8x8 texels in `format` into the read-back buffer at
+        // `offset`, 256 bytes a row.
+        let read_back = |list: &crate::host::HostList,
+                         texture: &ID3D12Resource,
+                         format: DXGI_FORMAT,
+                         offset: usize| {
+            // SAFETY: an open list; live resources, the texture a copy source.
+            unsafe {
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: offset as u64,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: format,
+                                Width: 8,
+                                Height: 8,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+        };
+        let depth_of = |value: u32| value as f32 / 65535.0;
+
+        let first = host.new_list().unwrap();
+        crate::list::clear_depth_stencil(
+            &first,
+            &clear_view,
+            1 | 2,
+            depth_of(VALUES[CLEARED]),
+            STENCIL as u8,
+            None,
+        );
+        // As `readable` does for a table's unordered access views, before
+        // the dispatch binds its state (`State::bind`).
+        crate::list::ensure_state(&first, target, UNORDERED_ACCESS);
+        // SAFETY: an open list; our heap, root signature and pipeline.
+        unsafe {
+            let l = &first.list;
+            let table = fill_views.heap.GetGPUDescriptorHandleForHeapStart();
+            l.SetDescriptorHeaps(&[Some(fill_views.heap.clone())]);
+            l.SetComputeRootSignature(&fill_root);
+            l.SetPipelineState(&fill_pso);
+            l.SetComputeRootDescriptorTable(0, table);
+            l.Dispatch(1, 1, 1);
+        }
+        first.close();
+        assert_eq!(host.log_messages(), None, "debug layer");
+        host.execute(&[&first]);
+
+        let second = host.new_list().unwrap();
+        // The title's state for its draws, as `State::set_targets` and the
+        // fixed-function calls set it.
+        let depth = host_resource(target).unwrap().clone();
+        second.set_targets(
+            vec![(color.clone(), None)],
+            Some((depth, draw_view.depth_desc())),
+        );
+        second.set_viewports(&[D3D12_VIEWPORT {
+            Width: 8.0,
+            Height: 8.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        }]);
+        second.set_scissors(&[RECT {
+            right: 8,
+            bottom: 8,
+            ..Default::default()
+        }]);
+        second.set_topology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        // As a draw readies its depth target (`State::prepare_for`).
+        crate::list::ensure_state(&second, target, DEPTH_WRITE);
+        let rtv = host.rtv(&color, None);
+        // SAFETY: an open list; our pipeline, fresh views of live textures
+        // in the states they need.
+        unsafe {
+            let l = &second.list;
+            l.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            l.SetGraphicsRootSignature(&draw_root);
+            l.SetPipelineState(&draw_pso);
+            for form in 0..2 {
+                for (id, &k) in (1u32..).zip(&VALUES) {
+                    let constants = [k, form, id];
+                    l.SetGraphicsRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+                    l.DrawInstanced(3, 1, 0, 0);
+                }
+            }
+            l.ResourceBarrier(&[crate::host::transition(
+                &color,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        read_back(&second, &color, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+        if readable {
+            // As a dispatch readies what it reads and writes.
+            crate::list::ensure_state(&second, target, SHADER_RESOURCE);
+            crate::list::ensure_state(&second, probed, UNORDERED_ACCESS);
+            // SAFETY: an open list; our heap, root signature and pipeline.
+            unsafe {
+                let l = &second.list;
+                let table = probe_views.heap.GetGPUDescriptorHandleForHeapStart();
+                l.SetDescriptorHeaps(&[Some(probe_views.heap.clone())]);
+                l.SetComputeRootSignature(&probe_root);
+                l.SetPipelineState(&probe_pso);
+                l.SetComputeRootDescriptorTable(0, table);
+                l.Dispatch(1, 1, 1);
+            }
+            crate::list::ensure_state(&second, probed, COPY_SOURCE);
+            let probed = host_resource(probed).unwrap();
+            read_back(&second, probed, DXGI_FORMAT_R32_UINT, PROBED_AT);
+        }
+        second.close();
+        assert_eq!(host.log_messages(), None, "debug layer");
+        host.execute(&[&second]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copies finished (execute waits); the whole buffer.
+        let read = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 2 * 8 * 256)
+        };
+        let mut found = Found {
+            misses: [Vec::new(), Vec::new()],
+            probe: Vec::new(),
+        };
+        for y in 0..8 {
+            for x in 0..8 {
+                let i = if x < 7 { (x + y) % 8 } else { CLEARED };
+                let texel = &read[y * 256 + 4 * x..][..4];
+                for (form, misses) in found.misses.iter_mut().enumerate() {
+                    // Draws that passed, the sum of their numbers.
+                    let got = (texel[2 * form], texel[2 * form + 1]);
+                    if got != (1, i as u8 + 1) {
+                        misses.push(format!("({x}, {y}) holds {}: {got:?}", VALUES[i]));
+                    }
+                }
+                if readable {
+                    let at = PROBED_AT + y * 256 + 4 * x;
+                    let got = u32::from_le_bytes(read[at..at + 4].try_into().unwrap());
+                    let stencil = if x == 6 { WRITTEN } else { STENCIL };
+                    let wanted = VALUES[i] | stencil << 16;
+                    if got != wanted {
+                        found.probe.push(format!("({x}, {y}): {got:#x}, not {wanted:#x}"));
+                    }
+                }
+            }
+        }
+        Some(found)
+    }
+
+    /// The console's 16-bit depth as host D16 ([`d16_depth`]): draws at its
+    /// values' depths worked out otherwise than the title's 16 bits read
+    /// pass depth equal exactly where each value was written, as on the
+    /// console, whether the twin is copied to a typeless or a typed depth
+    /// target; the stencil apart is cleared, written and read through the
+    /// title's views; the debug layer reports nothing.
+    #[cfg(windows)]
+    #[test]
+    fn equal_tested_draws_at_console_equivalent_depths_pass_on_16_bit_depth() {
+        for readable in [true, false] {
+            let Some(found) = console_equivalent_depths(true, readable) else {
+                return; // no host GPU here
+            };
+            for (form, misses) in found.misses.iter().enumerate() {
+                assert_eq!(misses, &[] as &[String], "form {form}, readable {readable}");
+            }
+            assert_eq!(found.probe, &[] as &[String], "probe, readable {readable}");
+        }
+    }
+
+    /// The same as D24S8 with passes of ours (the console's 16-bit depth
+    /// without [`d16_depth`]): what was written reads back, but draws at
+    /// `(k + 0.25) / 65535` (16-bit `k` on the console) miss every texel,
+    /// D24 holding their depth 64 steps from the written one's: why the
+    /// title's lighting found none of its material ids.
+    #[cfg(windows)]
+    #[test]
+    fn equal_tested_draws_off_the_written_depth_miss_on_24_bit_depth() {
+        let Some(found) = console_equivalent_depths(false, true) else {
+            return; // no host GPU here
+        };
+        assert_eq!(found.probe, &[] as &[String], "probe");
+        assert_eq!(found.misses[1].len(), 64, "form 1 passes nowhere");
+        // Form 0 (at k * (1 / 65535)) may land on the written depth's 24
+        // bits or not, by GPU; shown for the record.
+        eprintln!("form 0 misses on D24S8: {:?}", found.misses[0]);
     }
 
     #[test]

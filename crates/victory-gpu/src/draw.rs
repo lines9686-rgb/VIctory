@@ -310,6 +310,30 @@ impl State {
         }
     }
 
+    /// Logs, once each, a draw on a depth target that keeps its stencil
+    /// apart (the console's 16-bit depth as host D16,
+    /// `resource::d16_depth`) whose pipeline tests or writes the stencil
+    /// (the host has none there: the test passes everywhere, writes are
+    /// lost), or was made for another depth format than D16.
+    fn note_stencil_apart(&self, p: &HostPipeline) {
+        if self.depth == 0 || crate::resource::host_stencil(self.depth as This).is_none() {
+            return;
+        }
+        if p.stencil {
+            once!(
+                pipeline = %p.name,
+                "a draw tests or writes the stencil of the console's 16-bit depth, apart on the host (VICTORY_LOCAL_D16_DEPTH): it passes everywhere, writes are lost"
+            );
+        }
+        if p.depth_format != windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D16_UNORM {
+            once!(
+                format = p.depth_format.0,
+                pipeline = %p.name,
+                "a draw on the console's 16-bit depth as host D16 with a pipeline for another depth format"
+            );
+        }
+    }
+
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value.
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
@@ -372,6 +396,7 @@ impl State {
         // Targets first: a pass of ours that makes a depth target current
         // sets state of its own, which `bind` then replaces.
         self.ready_targets(list);
+        self.note_stencil_apart(p);
         if !self.bind(list, p, false) {
             return false;
         }

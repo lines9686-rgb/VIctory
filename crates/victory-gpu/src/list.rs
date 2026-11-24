@@ -460,6 +460,21 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            // Stencils kept apart go along (`ensure_state` moved them too).
+            match (
+                crate::resource::host_stencil(dst),
+                crate::resource::host_stencil(src),
+            ) {
+                // SAFETY: an open list and live textures in the copy states.
+                (Some(to), Some(from)) => unsafe { list.list.CopyResource(to, from) },
+                (None, None) => {}
+                _ => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!("a copy between textures with and without a stencil apart: the stencil is not copied")
+                    });
+                }
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -549,11 +564,20 @@ extern "system" fn copy_texture_region(
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            let index = src.footprint.offset;
+            if let Some((stencil, index)) = stencil_subresource(src.resource, index) {
+                (from.resource, from.footprint.offset) = (stencil, index);
+            }
         }
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        if dst.kind != FOOTPRINT
+            && let Some(at) = stencil_subresource(dst.resource, dst.footprint.offset)
+        {
+            (to_location.resource, to_location.footprint.offset) = at;
+        }
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
@@ -594,6 +618,23 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Where subresource `index` (a copy location's, its first word) of a
+/// title texture whose stencil is kept apart (the console's 16-bit depth
+/// as host D16, `resource::d16_depth`) is, if in the stencil's plane: the
+/// stencil texture (as a copy location names it) and the index in it (the
+/// plane's subresources follow all of the depth's).
+#[cfg(windows)]
+fn stencil_subresource(resource: This, index: u64) -> Option<(This, u64)> {
+    use windows::core::Interface;
+    let stencil = crate::resource::host_stencil(resource)?;
+    // SAFETY: a live resource.
+    let d = unsafe { stencil.GetDesc() };
+    let per_plane = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
+    let index = index as u32; // the location's subresource index
+    let at = stencil.as_raw().cast_const().cast();
+    (index >= per_plane).then(|| (at, u64::from(index - per_plane)))
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -738,32 +779,74 @@ extern "system" fn clear_dsv(
 ) {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
         else {
-            return;
-        };
-        let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(record.resource),
-            crate::host::host(),
-        ) else {
             return;
         };
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
-        const DEPTH_WRITE: u32 = 0x10;
-        ensure_state(list, record.resource, DEPTH_WRITE);
-        let dsv = host.dsv(texture, record.depth_desc().as_ref());
-        // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
-        };
+        clear_depth_stencil(list, &record, flags, depth, stencil, rects);
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
+}
+
+/// Records a clear of the title's depth view `record` (flags: 1 depth, 2
+/// stencil) within `rects` (all of it for none). A stencil kept apart
+/// (the console's 16-bit depth as host D16, `resource::d16_depth`) is
+/// cleared on its own, the depth view's mip of it.
+#[cfg(windows)]
+pub(crate) fn clear_depth_stencil(
+    list: &crate::host::HostList,
+    record: &crate::descriptor::RtvRecord,
+    flags: u32,
+    depth: f32,
+    stencil: u8,
+    rects: Option<&[windows::Win32::Foundation::RECT]>,
+) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT};
+    const DEPTH: u32 = 1;
+    const STENCIL: u32 = 2;
+    let (Some(texture), Some(copy), Some(host)) = (
+        crate::resource::host_resource(record.resource),
+        crate::resource::host_copy(record.resource),
+        crate::host::host(),
+    ) else {
+        return;
+    };
+    let desc = record.depth_desc();
+    let mut flags = flags & (DEPTH | STENCIL);
+    if copy.stencil_alone && flags & STENCIL != 0 {
+        // SAFETY: the union member the view dimension names.
+        let mip = desc.map_or(0, |d| unsafe {
+            match d.ViewDimension {
+                D3D12_DSV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.MipSlice,
+                D3D12_DSV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.MipSlice,
+                _ => 0,
+            }
+        });
+        list.clear_stencil(&copy, mip, stencil, rects.unwrap_or_default());
+        flags &= !STENCIL;
+    }
+    // A view without a stencil (16-bit depth, its stencil lost if it could
+    // not be kept apart; 32-bit depth) has none to clear.
+    if desc.is_some_and(|d| [DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT].contains(&d.Format)) {
+        flags &= !STENCIL;
+    }
+    if flags == 0 {
+        return;
+    }
+    const DEPTH_WRITE: u32 = 0x10;
+    ensure_state(list, record.resource, DEPTH_WRITE);
+    let dsv = host.dsv(texture, desc.as_ref());
+    // SAFETY: an open list, a fresh view of a live texture.
+    unsafe {
+        list.list
+            .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32), depth, stencil, rects)
+    };
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses

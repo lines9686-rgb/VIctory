@@ -1071,7 +1071,9 @@ impl HostList {
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
     /// the texture there at submission. A depth target with a twin is given
-    /// unordered access through the twin ([`HostList::sync_twin`]).
+    /// unordered access through the twin ([`HostList::sync_twin`]); a
+    /// stencil kept apart follows the title's state where it can
+    /// ([`HostList::move_stencil`]).
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
@@ -1080,8 +1082,15 @@ impl HostList {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let mut unordered = false;
-        for twin in [&copy.twin, &copy.stencil].into_iter().flatten() {
+        if let Some(twin) = &copy.twin {
             unordered |= self.sync_twin(&copy, twin, wanted);
+        }
+        if let Some(stencil) = &copy.stencil {
+            unordered |= if copy.stencil_alone {
+                self.move_stencil(stencil, wanted)
+            } else {
+                self.sync_twin(&copy, stencil, wanted)
+            };
         }
         if unordered {
             // Unordered access goes to the twins; the depth stays as it is.
@@ -1149,6 +1158,48 @@ impl HostList {
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }
         unordered
+    }
+
+    /// Moves a stencil kept apart (`HostTexture::stencil_alone`) to the
+    /// part of the title's `wanted` state that concerns it: unordered
+    /// access, shader reads, copies. Depth and render target use leave it as
+    /// it is (no draw tests it). Whether `wanted` is unordered access.
+    fn move_stencil(&self, stencil: &HostCopy, wanted: u32) -> bool {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        // Unordered access, shader reads (non-pixel, pixel), copies.
+        const CONCERNS: u32 = 0x8 | 0x40 | 0x80 | 0x400 | 0x800;
+        let unordered = wanted & UNORDERED_ACCESS != 0;
+        let state = if unordered {
+            UNORDERED_ACCESS
+        } else {
+            wanted & CONCERNS
+        };
+        if state != 0
+            && let Some(barrier) = self.move_to(stencil, state)
+        {
+            // SAFETY: an open list and a live texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+        unordered
+    }
+
+    /// Records, in this list, mip `mip` of the stencil `depth` keeps apart
+    /// (`HostTexture::stencil_alone`) cleared to `value` within `rects`
+    /// (all of it for none), as a clear of a depth view's stencil
+    /// (`list::clear_dsv`). Leaves descriptor heaps of its own.
+    pub(crate) fn clear_stencil(&self, depth: &HostCopy, mip: u32, value: u8, rects: &[RECT]) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let Some(stencil) = depth.stencil.as_ref().filter(|_| depth.stencil_alone) else {
+            return;
+        };
+        let Some(clears) = &stencil.clears else {
+            return;
+        };
+        if let Some(barrier) = self.move_to(stencil, UNORDERED_ACCESS) {
+            // SAFETY: an open list and a live texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+        clears.clear(self, &stencil.texture, mip, value, rects);
     }
 
     /// Records a copy of all of `src` into `dst` (a depth target and its

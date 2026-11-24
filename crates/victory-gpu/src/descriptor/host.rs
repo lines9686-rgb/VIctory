@@ -1188,6 +1188,60 @@ fn texture_srv_desc(
     view
 }
 
+/// Stencil formats whose stencil is in G: the console's 16-bit depth's
+/// (X16_TYPELESS_G8_UINT) and the host's 24- and 32-bit depths'
+/// (X24_TYPELESS_G8_UINT, X32_TYPELESS_G8X24_UINT).
+const G8: [u32; 3] = [120, 47, 22];
+
+/// Whether a title shader view (`words`) of a depth target names its
+/// stencil: in a stencil format ([`G8`]) or as plane 1.
+fn names_stencil(words: &[u32; 10]) -> bool {
+    if G8.contains(&words[0]) {
+        return true;
+    }
+    let view = srv_desc(words);
+    // SAFETY: the union member the view dimension names.
+    let plane = unsafe {
+        match view.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => view.Anonymous.Texture2D.PlaneSlice,
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => view.Anonymous.Texture2DArray.PlaneSlice,
+            _ => 0,
+        }
+    };
+    plane == 1
+}
+
+/// The shader view of a stencil kept apart (R8_TYPELESS, one plane) for
+/// the title's view `words` of the stencil: R8_UINT, plane 0, and a
+/// stencil format's G (the stencil) read from R, its R (no data) as 0.
+fn stencil_srv(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let mut view = srv_desc(words);
+    view.Format = DXGI_FORMAT_R8_UINT;
+    if G8.contains(&words[0]) {
+        // Three bits per component: 0-3 a channel, 4 zero, 5 one.
+        const R: u32 = 0;
+        const G: u32 = 1;
+        const ZERO: u32 = 4;
+        let mut mapping = view.Shader4ComponentMapping;
+        for component in 0..4 {
+            let shift = 3 * component;
+            let from = match mapping >> shift & 7 {
+                R => ZERO,
+                G => R,
+                other => other,
+            };
+            mapping = mapping & !(7 << shift) | from << shift;
+        }
+        view.Shader4ComponentMapping = mapping;
+    }
+    match view.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => view.Anonymous.Texture2D.PlaneSlice = 0,
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => view.Anonymous.Texture2DArray.PlaneSlice = 0,
+        _ => {}
+    }
+    view
+}
+
 /// Logs, once per kind, an unordered access view of a depth target: the
 /// title's texture format, the host's, the view's format and plane, and
 /// whether a twin serves it or its writes are dropped. Says which depth
@@ -1264,6 +1318,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            // A stencil kept apart (the console's 16-bit depth as host D16).
+            if let Some(words) = desc
+                && names_stencil(words)
+                && let Some(stencil) = crate::resource::host_stencil(resource)
+            {
+                let view = stencil_srv(words);
+                // SAFETY: a live texture and a slot of our heap.
+                unsafe { device.CreateShaderResourceView(stencil, Some(&raw const view), at) };
+                return Some(Some(stencil.clone()));
+            }
             if let Some(texture) = crate::resource::host_resource(resource) {
                 // SAFETY: a live host texture.
                 let info = unsafe { texture.GetDesc() };
