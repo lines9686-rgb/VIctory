@@ -124,7 +124,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 16384 (2^14, below the host's ~2 s GPU watchdog; own shader cache entries; works in release builds too); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow; a higher `n` shows whether a wrong result comes from a legitimate loop the default cut short |
+| `VICTORY_SHADER_SPIN_LIMIT=<n>` | loops that only reread memory until another workgroup or queue changes it (spin waits) stop after `n` iterations per lane instead of 4096 (own shader cache entries); never more than the general limit; `16384` gives them the general limit |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

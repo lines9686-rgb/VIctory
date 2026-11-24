@@ -88,6 +88,7 @@ mod lane_read_loop_tests;
 mod lower;
 mod sampler;
 mod shader;
+mod spin;
 #[cfg(all(test, windows))]
 mod split_tests;
 #[cfg(windows)]
@@ -107,32 +108,61 @@ pub use shader::{
     ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
 };
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 2^14 (16,384), under the host's
+/// GPU watchdog (see `lower::LOOP_LIMIT`).
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
-/// every lane of a full-screen pass still runs for seconds (2^20 times a
-/// 4K screen is about 10^13 iterations); a much lower limit shows whether
-/// such loops are what makes a frame slow. The value is part of the
-/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+/// `VICTORY_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least 1) sets it
+/// instead, in every build: a release build can then show which loops
+/// make a frame slow without a diagnostics build. A loop that hits the
+/// limit in every lane of a full-screen pass still costs (2^14 times a 4K
+/// screen is about 10^11 iterations); a lower value shows whether such
+/// loops are what makes a frame slow. The default cuts short a legitimate
+/// loop of more than 16,384 iterations per lane, which then gives a wrong
+/// result; a higher value (the old default was `0x100000`) shows whether a
+/// wrong result comes from that, at the risk of the watchdog removing the
+/// device. The value is part of the translation, so the shader cache must
+/// key on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
+        parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
+    })
+}
+
+/// The spin-wait limit without an override: 4096.
+pub const DEFAULT_SPIN_LIMIT: u32 = 1 << 12;
+
+/// The iteration count after which a loop that only waits for memory to
+/// change (a spin wait, see `spin.rs`) is left: [`DEFAULT_SPIN_LIMIT`], or
+/// `VICTORY_SHADER_SPIN_LIMIT` (decimal or `0x` hex, at least 1), never
+/// more than [`loop_limit`]. On the console the write such a loop waits
+/// for comes within microseconds; on the host, when it never comes (the
+/// writer's view is another host resource, null, or the load was hoisted),
+/// 2^20 uncached reads per lane (the old general limit) cost about a
+/// second per wave, which is what world frames spent per host submission;
+/// 4096 reads are a few milliseconds, a quarter of the general limit's
+/// 2^14. Part of the translation: the shader cache keys on it.
+pub fn spin_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHADER_SPIN_LIMIT").ok();
+        parse_limit(v.as_deref(), DEFAULT_SPIN_LIMIT).min(loop_limit())
     })
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
+    parse_limit(value, lower::LOOP_LIMIT)
+}
+
+/// A limit's value from its variable; `default` when it is unset,
+/// unreadable or 0.
+fn parse_limit(value: Option<&str>, default: u32) -> u32 {
     let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
@@ -141,7 +171,7 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
         });
     match parsed {
         Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
+        _ => default,
     }
 }
 
@@ -503,12 +533,14 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::Target;
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
+        assert_eq!(LOOP_LIMIT, 16_384);
         assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
         assert_eq!(parse_loop_limit(Some("4096")), 4096);
         assert_eq!(parse_loop_limit(Some(" 0x1000 ")), 4096);
@@ -517,7 +549,18 @@ mod tests {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
     }
+
+    #[test]
+    fn the_spin_limit_parses_with_its_own_default() {
+        use super::{DEFAULT_SPIN_LIMIT, parse_limit};
+        assert_eq!(parse_limit(None, DEFAULT_SPIN_LIMIT), 4096);
+        assert_eq!(parse_limit(Some("0x40"), DEFAULT_SPIN_LIMIT), 64);
+        assert_eq!(parse_limit(Some("0"), DEFAULT_SPIN_LIMIT), 4096);
+        // Spin waits never get more than the general limit.
+        const { assert!(DEFAULT_SPIN_LIMIT <= LOOP_LIMIT) };
+    }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
