@@ -67,6 +67,20 @@ const IN_HALF: &[u32] = &[
 ];
 
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
+    let StageIo::Cs(io) = &native.io else {
+        unreachable!()
+    };
+    let dwords = io.threads.iter().product::<u32>() * groups;
+    run_sized(host, native, groups, dwords)
+}
+
+/// [`run`] with a UAV of `dwords` dwords (zeroed).
+fn run_sized(
+    host: &Host,
+    native: &crate::NativeProgram,
+    groups: u32,
+    dwords: u32,
+) -> Result<Vec<u32>, String> {
     let target = host.target();
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
     // The validator, where one is installed: drivers take some modules it
@@ -79,11 +93,7 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
     }
     let (root, pso) = host.compute_pipeline(&cs)?;
     let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
-    let StageIo::Cs(io) = &native.io else {
-        unreachable!()
-    };
-    let n = io.threads.iter().product::<u32>() * groups;
-    let views = [View::RawUav(n)];
+    let views = [View::RawUav(dwords)];
     let out = host.dispatch(
         &root,
         &pso,
@@ -1098,5 +1108,74 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
             .expect_err("stops")
             .to_string();
         assert!(e.contains(why), "{lanes_min}..{lanes_max}: {e}");
+    }
+}
+
+/// The console's wave-wide allocation, as binning and compaction passes
+/// write it: an inclusive sum of the lane ids over the whole console wave
+/// (a whole-wave section), then a branch only lane 63 takes, in the upper
+/// half, adds the wave's total to a counter with an atomic that returns the
+/// old value, and after the branch every lane reads that old value from lane
+/// 63 and adds its exclusive prefix. Both groups add to the same counter
+/// (dword 128, past the results), so each group's base is 0 or 2016, the
+/// same in all its lanes, the two groups' bases differ, and the counter ends
+/// at 4032: the atomic ran once per console wave, not once per host wave or
+/// per lane.
+///
+/// On a host without 64-lane waves this runs in the console flow: the lower
+/// half has no lane in the branch, yet must see what lane 63 got there.
+#[test]
+fn wave_allocation_by_the_last_lane_crosses_the_halves() {
+    let mut body = reduction_scan(37, 0x80); // v1: inclusive sum, s10: total
+    body.extend([
+        0x7E0C_020A, // v_mov_b32 v6, s10
+        0x7D84_00BF, // v_cmp_eq_u32 vcc, 63, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xE0C8_4200,
+        0x8001_0600, // buffer_atomic_add v6, off, s[4:7], 0 offset:512 glc
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0xD760_000B,
+        0x0001_7F06, // v_readlane_b32 s11, v6, 63
+        0x4C02_0101, // v_sub_nc_u32 v1, v1, v0
+        0x4A04_020B, // v_add_nc_u32 v2, s11, v1
+    ]);
+    let p = program(&body, 64);
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let cs = emit_for(&p, nvidia).expect("translates for 32-lane hosts");
+    assert_eq!(wave_size(&cs.dxil), Some(32), "two 32-lane halves");
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let split = !host.target().runs(64);
+        let out = run_sized(&host, &p, 2, 2 * 64 + 4)
+            .unwrap_or_else(|e| panic!("{name}: wave allocation: {e}"));
+        assert_eq!(out[128], 4032, "{name}: the counter (split {split})");
+        let mut bases = Vec::new();
+        for g in 0..2 {
+            let lanes = &out[g * 64..g * 64 + 64];
+            let base = lanes[0];
+            assert!(base == 0 || base == 2016, "{name}: group {g} base {base}");
+            for (t, &v) in lanes.iter().enumerate() {
+                let t = t as u32;
+                assert_eq!(
+                    v,
+                    base + t * t.saturating_sub(1) / 2,
+                    "{name}: group {g} lane {t} (split {split})"
+                );
+            }
+            bases.push(base);
+        }
+        assert_ne!(bases[0], bases[1], "{name}: both groups got one base");
+        eprintln!("{name}: wave allocation exact (split {split})");
     }
 }
