@@ -384,7 +384,14 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         (0.0, finite.fold(0.0f32, f32::max))
     };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
+    // LOCAL diagnostic: tell 0 from NaN/Inf, and print tiny targets exactly.
+    let all = values.iter().flatten();
+    let nan = all.clone().filter(|v| v.is_nan()).count();
+    let inf = all.clone().filter(|v| v.is_infinite()).count();
+    let zero = all.clone().filter(|v| **v == 0.0).count();
+    let total = values.len() * 3;
+    let sample = (values.len() <= 16).then(|| format!("{:?}", values));
+    tracing::info!(format, low, high, nan, inf, zero, total, sample, "target values");
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
