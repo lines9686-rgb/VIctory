@@ -449,6 +449,13 @@ impl Host {
         })
     }
 
+    /// The most lanes a wave of the host GPU runs (from [`Self::target`]; 64 when
+    /// unknown, so nothing is refused for it). LOCAL: #578 on top of #439.
+    pub(crate) fn wave_lanes_max(&self) -> u32 {
+        let t = self.target();
+        if t == victory_shader::emit::Target::ANY { 64 } else { t.lanes_max }
+    }
+
     /// The wave sizes the host runs (D3D12 options 1), which translated
     /// compute shaders that declare the console's wave size must fit;
     /// logged once. Unknown (the query fails): any.
