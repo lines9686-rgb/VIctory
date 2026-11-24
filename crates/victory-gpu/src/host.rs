@@ -1453,7 +1453,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let (whole, done) = read_partial(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -1461,9 +1461,28 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
+    let done = done.min(len);
+    // Something is unmapped at or after `src + done`: walk VirtualQuery regions
+    // for the remaining tail so large committed spans take one ReadProcessMemory
+    // each and unmapped holes are zeroed in one memset, falling back to
+    // 64 KiB -> 4 KiB pieces if a concurrent unmap races between VirtualQuery
+    // and ReadProcessMemory.
+    for_regions(src as usize + done, len - done, |at, n, committed| {
+        let to = dst.wrapping_add(at - src as usize);
+        if !committed {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, n) };
+        } else if !read(at as *const u8, to, n) {
+            copy_pieces(dst, src, at, n);
+        }
+    });
+}
+
+/// Piece-by-piece fallback (64 KiB, then 4 KiB) for `[start, start + len)`.
+fn copy_pieces(dst: *mut u8, src: *const u8, start: usize, len: usize) {
+    for_pieces(start, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
         if !read(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
@@ -1488,12 +1507,22 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_partial(src, dst, len).0
+}
+
+/// Copies up to `len` bytes from `src` to `dst`, returning `(ok, bytes_read)`.
+/// On a partial copy (`ok == false`), the first `bytes_read` bytes are already
+/// written into `dst`.
+fn read_partial(src: *const u8, dst: *mut u8, len: usize) -> (bool, usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let ok = unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
+    };
+    (ok, done)
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -1501,23 +1530,74 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let write = |at: usize, n: usize| {
+    let write_partial = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        let ok = unsafe {
+            WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0
+        };
+        (ok, done)
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 {
         return;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+    let (ok, done) = write_partial(dst as usize, len);
+    if ok {
+        return;
+    }
+    let done = done.min(len);
+    for_regions(dst as usize + done, len - done, |at, n, committed| {
+        if committed && !write_partial(at, n).0 {
+            for_pieces(at, n, 64 << 10, |at, n| {
+                if !write_partial(at, n).0 {
+                    for_pieces(at, n, 4 << 10, |at, n| {
+                        write_partial(at, n);
+                    });
+                }
             });
         }
     });
+}
+
+/// Walks `[start, start + len)` in `VirtualQuery` regions, passing `(at, n,
+/// committed)` where `committed` is true for `MEM_COMMIT` regions that are
+/// neither `PAGE_NOACCESS` nor `PAGE_GUARD`.
+fn for_regions(start: usize, len: usize, mut f: impl FnMut(usize, usize, bool)) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = start + len;
+    let mut at = start;
+    while at < end {
+        let mut mbi = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+        // SAFETY: `mbi` has the exact size `VirtualQuery` expects.
+        let queried = unsafe {
+            VirtualQuery(
+                at as *const _,
+                mbi.as_mut_ptr(),
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 {
+            f(at, end - at, true);
+            break;
+        }
+        // SAFETY: `VirtualQuery` returned non-zero, initializing `mbi`.
+        let mbi = unsafe { mbi.assume_init() };
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if region_end <= at {
+            f(at, end - at, true);
+            break;
+        }
+        let next = region_end.min(end);
+        let committed = mbi.State == MEM_COMMIT
+            && (mbi.Protect & PAGE_GUARD) == 0
+            && (mbi.Protect & 0xff) != PAGE_NOACCESS;
+        f(at, next - at, committed);
+        at = next;
+    }
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -2192,5 +2272,121 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    /// `copy_mapped` and `write_mapped` handle committed regions interleaved
+    /// with reserved (unmapped) holes: committed bytes round-trip and holes
+    /// read as zero / are skipped on write.
+    #[test]
+    fn copy_mapped_and_write_mapped_handle_holes_across_regions() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const TOTAL: usize = 2 << 20;
+        const CHUNK: usize = 512 << 10;
+        // SAFETY: reserving a 2 MiB private virtual range.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let base = base.cast::<u8>();
+        // SAFETY: committing two 512 KiB slices at 0 and 1 MiB and filling them.
+        unsafe {
+            assert!(!VirtualAlloc(base.cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(
+                !VirtualAlloc(base.add(2 * CHUNK).cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE)
+                    .is_null()
+            );
+            base.write_bytes(0x3C, CHUNK);
+            base.add(2 * CHUNK).write_bytes(0x5A, CHUNK);
+        }
+
+        // Pre-dirty destination so we verify holes are explicitly zeroed.
+        let mut dst = vec![0xAAu8; TOTAL];
+        super::copy_mapped(dst.as_mut_ptr(), base, TOTAL, false);
+        assert!(dst[..CHUNK].iter().all(|&b| b == 0x3C));
+        assert!(dst[CHUNK..2 * CHUNK].iter().all(|&b| b == 0));
+        assert!(dst[2 * CHUNK..3 * CHUNK].iter().all(|&b| b == 0x5A));
+        assert!(dst[3 * CHUNK..].iter().all(|&b| b == 0));
+
+        // write_mapped writes both committed regions and skips both holes.
+        let mut src = vec![0xEEu8; TOTAL];
+        src[..CHUNK].fill(0x71);
+        src[2 * CHUNK..3 * CHUNK].fill(0x92);
+        super::write_mapped(base, src.as_ptr(), TOTAL);
+        // SAFETY: both slices are committed and readable; then release the reservation.
+        unsafe {
+            assert!(std::slice::from_raw_parts(base, CHUNK).iter().all(|&b| b == 0x71));
+            assert!(
+                std::slice::from_raw_parts(base.add(2 * CHUNK), CHUNK)
+                    .iter()
+                    .all(|&b| b == 0x92)
+            );
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// Compares the old 64 KiB piece fallback against the `VirtualQuery`
+    /// region fallback on 64 MiB ranges with small (4 KiB) and large (32 MiB)
+    /// unmapped holes. Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture copy_mapped_hole`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn copy_mapped_hole_benchmark() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const TOTAL: usize = 64 << 20;
+        const RUNS: usize = 16;
+        for (label, hole_at, hole_len) in [
+            ("4 KiB hole at 32 MiB", 32 << 20, 4 << 10),
+            ("32 MiB hole at 16 MiB", 16 << 20, 32 << 20),
+        ] {
+            // SAFETY: reserving a 64 MiB private range.
+            let base =
+                unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_NOACCESS) };
+            assert!(!base.is_null());
+            let base = base.cast::<u8>();
+            // SAFETY: committing two slices around the hole and initializing them.
+            unsafe {
+                assert!(!VirtualAlloc(base.cast(), hole_at, MEM_COMMIT, PAGE_READWRITE).is_null());
+                assert!(
+                    !VirtualAlloc(
+                        base.add(hole_at + hole_len).cast(),
+                        TOTAL - hole_at - hole_len,
+                        MEM_COMMIT,
+                        PAGE_READWRITE,
+                    )
+                    .is_null()
+                );
+                base.write_bytes(0x11, hole_at);
+                base.add(hole_at + hole_len)
+                    .write_bytes(0x22, TOTAL - hole_at - hole_len);
+            }
+            let mut dst = vec![0u8; TOTAL];
+            // Warm up both paths.
+            super::copy_pieces(dst.as_mut_ptr(), base, base as usize, TOTAL);
+            super::copy_mapped(dst.as_mut_ptr(), base, TOTAL, false);
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..RUNS {
+                // Old path: initial failing read + full 64 KiB/4 KiB piece fallback.
+                let _ = super::read(base, dst.as_mut_ptr(), TOTAL);
+                super::copy_pieces(dst.as_mut_ptr(), base, base as usize, TOTAL);
+            }
+            let old = t0.elapsed();
+
+            let t1 = std::time::Instant::now();
+            for _ in 0..RUNS {
+                super::copy_mapped(dst.as_mut_ptr(), base, TOTAL, false);
+            }
+            let new = t1.elapsed();
+            // SAFETY: releasing the reservation.
+            unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+            println!(
+                "64 MiB ({label}, {RUNS} runs): old={old:?}, new={new:?} ({:.2}x)",
+                old.as_secs_f64() / new.as_secs_f64()
+            );
+        }
     }
 }
