@@ -295,7 +295,12 @@ pub(crate) struct HostPipeline {
 /// Vertex and pixel programs run per lane and are kept.
 // shortcut: a wave64 program that never looks at other lanes would run.
 fn needs_wave64(stage: &str, wave64: bool, lanes: u32) -> bool {
-    wave64 && lanes < 64 && matches!(stage, "mesh" | "compute")
+    // LOCAL test (KenzoPortela's measurement on #778): VICTORY_LOCAL_WAVE64_MESH=1 lets wave64 mesh
+    // programs run as 32-lane halves instead of refusing them.
+    static ALLOW_MESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let allow_mesh = *ALLOW_MESH
+        .get_or_init(|| std::env::var("VICTORY_LOCAL_WAVE64_MESH").is_ok_and(|v| v == "1"));
+    wave64 && lanes < 64 && (stage == "compute" || (stage == "mesh" && !allow_mesh))
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
